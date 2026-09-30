@@ -2,7 +2,8 @@ import { getCollectionSchema, listQueryableFields, listSelectableFields } from "
 import { getRolePolicy } from "@/src/security/policy";
 import type { AgentName, Caller, DatabaseAction, FieldChange } from "@/src/types";
 
-const MAX_LIMIT = 25;
+export const MAX_READ_LIMIT = 25;
+const MAX_OFFSET = 10_000;
 const MAX_BULK_UPDATE = 20;
 const MAX_CONDITIONS = 12;
 const MAX_FIELDS = 15;
@@ -31,8 +32,21 @@ export function authorize(agent: AgentName, caller: Caller, action: DatabaseActi
   if (!getCollectionSchema(action.collection)) throw new Error(`UNKNOWN_COLLECTION_SCHEMA:${action.collection}`);
   if (!rule.ops.includes(action.operation)) throw new Error(`OPERATION_NOT_ALLOWED:${action.operation}`);
 
+  if (caller.role === "PRODUCT_MANAGER" && ["epics", "user_stories"].includes(action.collection)
+    && ["insert_one", "insert_many"].includes(action.operation)) {
+    throw new Error("PM_REVIEW_REQUIRED:Use preview_requirements_draft. Only the PM's Approve and save action can insert reviewed epics and stories.");
+  }
+
   if ((action.conditions?.length ?? 0) > MAX_CONDITIONS) throw new Error(`TOO_MANY_CONDITIONS:${MAX_CONDITIONS}`);
-  if ((action.limit ?? 1) > MAX_LIMIT) throw new Error(`LIMIT_EXCEEDED:${MAX_LIMIT}`);
+  if (action.limit !== undefined && (!Number.isSafeInteger(action.limit) || action.limit < 1)) {
+    throw new Error("INVALID_LIMIT:Use a positive integer.");
+  }
+  if ((action.limit ?? 1) > MAX_READ_LIMIT) throw new Error(`LIMIT_EXCEEDED:${MAX_READ_LIMIT}`);
+  if (action.offset !== undefined) {
+    if (action.operation !== "find") throw new Error("OFFSET_ONLY_ALLOWED_FOR_FIND");
+    if (!Number.isSafeInteger(action.offset) || action.offset < 0) throw new Error("INVALID_OFFSET:Use a non-negative integer.");
+    if (action.offset > MAX_OFFSET) throw new Error(`OFFSET_EXCEEDED:${MAX_OFFSET}:Narrow the filters to continue.`);
+  }
 
   // OWN/ASSIGNED scope is server-derived. A developer is never allowed to target another user
   // by adding an assignee condition. This makes requests such as "show Rahul's tasks" a refusal,
@@ -95,7 +109,8 @@ export function authorize(agent: AgentName, caller: Caller, action: DatabaseActi
 
   return {
     rule,
-    maxLimit: MAX_LIMIT,
+    maxLimit: MAX_READ_LIMIT,
+    maxOffset: MAX_OFFSET,
     maxBulkUpdate: MAX_BULK_UPDATE,
     maxInsertMany: MAX_INSERT_MANY,
   };

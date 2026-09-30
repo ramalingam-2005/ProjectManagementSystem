@@ -13,7 +13,7 @@ function apiKey(): string {
   return value;
 }
 
-export function getModel() {
+export function getModel(maxTokens = 1800) {
   return new ChatGroq({
     apiKey: apiKey(),
 
@@ -24,7 +24,7 @@ export function getModel() {
     temperature: 0,
 
     // Give enough room for a complete tool call
-    maxTokens: 1800,
+    maxTokens,
 
     // Important for GPT-OSS:
     // don't waste many tokens reasoning

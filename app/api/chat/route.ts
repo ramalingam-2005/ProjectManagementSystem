@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { runChat } from "@/src/agent/supervisor";
 import { resolveCaller } from "@/src/repositories/user.repository";
+import { RequirementsReviewSchema } from "@/src/requirements-review";
 
 export const runtime = "nodejs";
 
@@ -18,8 +19,13 @@ export async function POST(request: Request) {
       );
     }
 
+    const parsedReview = body.requirementsReview === undefined
+      ? undefined : RequirementsReviewSchema.safeParse(body.requirementsReview);
+    if (parsedReview && !parsedReview.success) {
+      return NextResponse.json({ ok: false, error: "INVALID_REQUIREMENTS_REVIEW" }, { status: 400 });
+    }
     const caller = await resolveCaller(userId);
-    const result = await runChat({ caller, sessionId, message });
+    const result = await runChat({ caller, sessionId, message, requirementsReview: parsedReview?.data });
 
     return NextResponse.json({
       ok: true,
@@ -33,9 +39,13 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    const status = /USER_NOT_FOUND|USER_ID_REQUIRED/.test(message) ? 404
+    const status = message === "REVIEW_PM_ONLY" ? 403 : message.startsWith("REVIEW_") ? 409
+      : /USER_NOT_FOUND|USER_ID_REQUIRED/.test(message) ? 404
       : /INVALID_|REQUIRED|TOO_LONG/.test(message) ? 400
         : 500;
-    return NextResponse.json({ ok: false, error: message }, { status });
+    const errorMessage = message === "REVIEW_PM_ONLY" ? "Only a Product Manager can review this draft."
+      : message.startsWith("REVIEW_") ? "This draft changed or expired. Ask for a fresh draft to continue."
+      : message;
+    return NextResponse.json({ ok: false, error: errorMessage }, { status });
   }
 }

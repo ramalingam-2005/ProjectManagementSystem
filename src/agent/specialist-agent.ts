@@ -19,6 +19,9 @@ import { makeDatabaseTool } from "@/src/agent/db-tool";
 import { schemaContext } from "@/src/agent/schema-context";
 import { withModelRetry } from "@/src/utils/retry";
 import type { AgentName, AgentTrace, Caller } from "@/src/types";
+import { makeRequirementsDraftTool } from "@/src/agent/requirements-draft-tool";
+import type { RequirementsReview, RequirementsSaveResult } from "@/src/requirements-review";
+import type { RequirementsReviewService } from "@/src/services/requirements-review.service";
 
 let saverPromise: Promise<MongoDBSaver> | null = null;
 const MAX_TOOL_ROUNDS = 6;
@@ -63,11 +66,18 @@ function agentSpecificRules(agent: AgentName): string {
   if (agent === "REQUIREMENTS") {
     return [
       "REQUIREMENTS RULES:",
+      "- Search planning: use key only for an identifier supplied by the user or returned by a tool. Never convert descriptive text or its numbers into an invented FR/REQ key.",
+      "- For descriptive feature text, use find with contains on title and description and logic=OR. Preserve the user's words and spelling. If no records match, retry with a shorter meaningful phrase, then keyword conditions; keep distinguishing numbers. Return candidate titles, featureRequestKey and _id before asking for more information. A null exact lookup alone does not establish that a feature is absent.",
+      "- For multiple required keywords, use separate contains conditions with logic=AND within one field. Search title and description in separate calls when needed; the flat condition language does not support nested AND/OR groups. Never silently drop explicit status, ownership or product constraints.",
+      "- Related-record queries: read the feature first, then use its returned _id as featureRequestId on epics, or use virtual featureRequestKey on epics/user_stories. To read stories for an epic, use epicId or virtual epicKey. These server-resolved relationship filters serve the join need; do not emit an unsupported $lookup pipeline. Read only collections listed in your permissions.",
       "- Feature request statuses are NEW, UNDER_REVIEW, STORIES_DRAFTED, APPROVED, REJECTED, DEFERRED. Never invent PENDING_REVIEW.",
-      "- To draft from a feature request: first find the feature request, then create a DRAFT epic if needed, then insert 2-5 DRAFT user stories with acceptance criteria and story points.",
+      "- For PM drafting: first read the real feature request and any existing epic. Then call preview_requirements_draft with the COMPLETE proposed epic and 2-5 stories, including acceptance criteria, priorities and story points. This only presents a review; it does not save epics or stories.",
+      "- PM epic/story creation always requires the PM to review the latest draft and click Approve and save. Never insert epics or stories directly, even if a user asks to skip review or says yes/approved/save in chat.",
+      "- When the PM requests changes, incorporate them in a complete replacement preview. Pending drafts have no saved record IDs. Do not update database records to revise a pending draft.",
+      "- If a pending draft is already correct and the PM asks to save in chat, present it again for review and ask them to use Approve and save. Never claim it was inserted.",
       "- Never create engineering tasks during drafting. Tasks are created by the Engineering Lead after PM approval.",
       "- Use numberValue for storyPoints. Use stringListValue for acceptanceCriteria.",
-      "- When the PM explicitly approves stories, update their status to APPROVED.",
+      "- Saving a reviewed draft creates DRAFT records. Changing existing saved stories to APPROVED for engineering is a separate explicit PM request; never confuse it with approval to save a new draft.",
     ].join("\n");
   }
 
@@ -94,12 +104,14 @@ function systemPrompt(agent: AgentName, caller: Caller): string {
     `You are the ${AGENT_INFO[agent].label}.`,
     `Authenticated caller: ${caller.name} (${caller.role}), identity=${caller.userKey}.`,
     AGENT_INFO[agent].purpose,
-    "You have exactly ONE guarded database action tool. Use it for database facts and actions.",
+    "Use the guarded database action tool for database facts and permitted actions. PM requirements drafting also has a preview_requirements_draft tool for mandatory review before saving.",
     "The tool-facing schema is flat: nested conditions/fields are passed as JSON strings. Output VALID compact JSON inside those string parameters only.",
     "The schema below is your complete database boundary. Never invent collection names, field names, statuses, IDs or records.",
     "Never generate raw MongoDB syntax. Never request delete, drop, aggregate, replace or unrestricted database access.",
     "For public IDs use condition field=key with operator=eq.",
+    "For a feature title, query title using the user's original spelling; never silently correct stored names. If no exact record exists, the tool may return matches with matchType and requiresClarification. Show their stored titles, featureRequestKey and _id. Label partial matches as possible matches and ask the user to choose if several exist. Never claim not found when matches are returned. Do not mutate a suggested record without resolving the user's intended ID.",
     "For numeric database fields use numberValue, not stringValue.",
+    "Choose supported queries by intent: find/find_one for records, count for totals, contains/starts_with for literal text search, in for a set of values on stored fields, gt/gte/lt/lte for ranges, sortField/sortDirection for ordering, and approved calculate metrics for summaries. Virtual relationship fields accept eq/ne only. conditionsJson uses these operators, never raw $regex/$in/$lookup syntax. Use returned IDs to follow relationships and paginate before claiming complete totals.",
     "For a mutation, wait for the real tool result before claiming success.",
     "Never claim an update failed or invent a validation error without a tool result from this turn. Virtual mutation fields listed in mutableFields are supported by the backend. Earlier assistant explanations do not override the current schema or tool results.",
     "If the tool returns ok=false, state the refusal clearly and do not bypass it.",
@@ -108,6 +120,8 @@ function systemPrompt(agent: AgentName, caller: Caller): string {
     "Answer the latest user message. Earlier requests are historical context, not pending instructions. Do not answer an earlier question or resume an earlier action unless the latest message explicitly asks for it.",
     "Use conversation history only when relevant to the latest message, such as resolving it, that feature, those stories, that bug and that release. When the user changes topic, follow the new topic. Ask for clarification if a reference is ambiguous.",
     "For questions about current database facts, fetch relevant records in this turn. Historical tool results and earlier answers may be stale and are not evidence of the current state.",
+    "Find returns pages of at most 25 records. For 'all' requests, use limit=25 and follow nextOffset with the same filters and sort until hasMore=false or the action budget is reached. For a later 'next page' request, use the last result's nextOffset and query settings. Never claim a partial list is complete; if more remain, say so and offer to continue. If hasMore=true but nextOffset=null, ask for narrower filters.",
+    "For list requests, prefer default projections or a few summary fields. Retrieve long descriptions and logs only when requested.",
     "Keep final answers concise and grounded in returned records.",
     agentSpecificRules(agent),
     "\nAPPROVED SCHEMA AND PERMISSIONS\n" + schemaContext(agent, caller.role),
@@ -155,21 +169,36 @@ export async function runSpecialistAgent(input: {
   caller: Caller;
   threadId: string;
   message: string;
+  requirements?: { service: RequirementsReviewService; revision: string; previous?: RequirementsReview; saved?: RequirementsSaveResult };
 }) {
   const traces: AgentTrace[] = [];
-  const dbTool = makeDatabaseTool(input.agent, input.caller, traces);
-  const toolNode = new ToolNode([dbTool]);
+  let requirementsReview: RequirementsReview | undefined;
+  const dbTool = makeDatabaseTool(input.agent, input.caller, traces, Boolean(input.requirements?.previous));
+  const tools = [dbTool];
+  const draftTool = input.requirements ? makeRequirementsDraftTool({
+    caller: input.caller, threadId: input.threadId, ...input.requirements,
+    onReview: (review) => { requirementsReview = review; },
+  }) : undefined;
+  const availableTools = draftTool ? [...tools, draftTool] : tools;
+  const toolNode = new ToolNode(availableTools);
   const answerModel = getModel();
-  const model = answerModel.bindTools([dbTool]);
+  const model = answerModel.bindTools(availableTools);
   let toolRounds = 0;
+  const prompt = [
+    systemPrompt(input.agent, input.caller),
+    input.requirements?.previous
+      ? "CURRENT UNSAVED DRAFT (data only; use the latest user message to revise it):\n" + JSON.stringify(input.requirements.previous.draft)
+      : "",
+  ].filter(Boolean).join("\n");
 
   const callModel = async (state: typeof MessagesAnnotation.State) => {
+    if (requirementsReview) return { messages: [new AIMessage("Please review the draft below. Request any changes, or choose Approve and save to create these records as DRAFT.")] };
     const messages = recentMessages(state.messages as BaseMessage[]);
     if (toolRounds >= MAX_TOOL_ROUNDS) {
       // All pending tools have completed. Finish without exposing any more tools.
       try {
         const response = await withModelRetry(() => answerModel.invoke([
-          new SystemMessage(systemPrompt(input.agent, input.caller)),
+          new SystemMessage(prompt),
           ...messages,
           new SystemMessage("The action budget for this request is exhausted. Give a final answer using the tool results already received. Clearly separate confirmed results, refusals, and unfinished work. Do not call tools, invent results, or promise to keep working."),
         ]));
@@ -179,7 +208,7 @@ export async function runSpecialistAgent(input: {
       return { messages: [new AIMessage("I stopped after several action rounds. Some actions may have completed; review Action details for their confirmed results before retrying. I could not finish summarizing this request.")] };
     }
     const response = await withModelRetry(() => model.invoke([
-      new SystemMessage(systemPrompt(input.agent, input.caller)),
+      new SystemMessage(prompt),
       ...messages,
     ]));
     return { messages: [response] };
@@ -202,7 +231,10 @@ export async function runSpecialistAgent(input: {
 
   const app = workflow.compile({ checkpointer: await getSaver() });
   const state = await app.invoke(
-    { messages: [new HumanMessage(input.message)] },
+    { messages: [
+      ...(input.requirements?.saved ? [new AIMessage("Confirmed save from the PM review action (new records are DRAFT): " + JSON.stringify(input.requirements.saved))] : []),
+      new HumanMessage(input.message),
+    ] },
     {
       configurable: { thread_id: input.threadId },
       // Two nodes per tool round, plus the final answer and graph overhead.
@@ -213,5 +245,6 @@ export async function runSpecialistAgent(input: {
   return {
     response: textContent(state.messages.at(-1) as BaseMessage | undefined) || "No response generated.",
     trace: traces,
+    requirementsReview,
   };
 }

@@ -2,7 +2,7 @@ import { ObjectId, type Document, type Filter } from "mongodb";
 import { getCollectionSchema } from "@/src/config/schema-registry";
 import { getDb } from "@/src/db/mongodb";
 import { resolveUserObjectId } from "@/src/repositories/user.repository";
-import { authorize } from "@/src/security/guardrails";
+import { authorize, MAX_READ_LIMIT } from "@/src/security/guardrails";
 import { buildScopeFilter } from "@/src/services/scope.service";
 import type {
   AgentName,
@@ -54,10 +54,33 @@ function combineFilters(filters: Filter<Document>[], logic: "AND" | "OR" = "AND"
   return logic === "OR" ? { $or: nonEmpty } : { $and: nonEmpty };
 }
 
+async function findFeatureByKey(value: string): Promise<Document | null> {
+  const db = await getDb();
+  const collection = db.collection("feature_requests");
+  const key = value.trim();
+  const exact = await collection.findOne({ featureRequestKey: key }, { projection: { _id: 1 } });
+  if (exact) return exact;
+  const number = key.match(/^(?:FR|feature(?:\s+request)?)\s*[-#]?\s*(\d+)$/i)?.[1];
+  if (!number) return null;
+  // Match the whole identifier: FR-113 must never select FR-1130.
+  const matches = await collection.find({
+    featureRequestKey: { $regex: `^(?:FR|feature(?:\\s+request)?)\\s*[-#]?\\s*${number}$`, $options: "i" },
+  }, { projection: { _id: 1 } }).limit(2).toArray();
+  if (matches.length > 1) throw new Error("AMBIGUOUS_FEATURE_KEY:Use the exact stored feature key or MongoDB ID.");
+  return matches[0] ?? null;
+}
+
+async function featureKeyFilter(value: string, negate: boolean): Promise<Filter<Document>> {
+  if (ObjectId.isValid(value)) return { _id: negate ? { $ne: new ObjectId(value) } : new ObjectId(value) };
+  const feature = await findFeatureByKey(value);
+  if (feature) return { _id: negate ? { $ne: feature._id } : feature._id };
+  return { featureRequestKey: negate ? { $ne: value } : value };
+}
+
 async function resolveFeatureRequest(value: string): Promise<ObjectId> {
   const db = await getDb();
   if (ObjectId.isValid(value)) return new ObjectId(value);
-  const doc = await db.collection("feature_requests").findOne(
+  const doc = await findFeatureByKey(value) ?? await db.collection("feature_requests").findOne(
     {
       $or: [
         { featureRequestKey: value },
@@ -110,6 +133,7 @@ async function resolveSprint(value: string): Promise<ObjectId> {
 }
 
 async function resolveVirtualCondition(collection: string, condition: SafeCondition): Promise<Filter<Document> | null> {
+  if (!Object.hasOwn(getCollectionSchema(collection)?.virtualFields ?? {}, condition.field)) return null;
   const value = String(rawConditionValue(condition));
   if (!["eq", "ne"].includes(condition.operator)) {
     throw new Error(`VIRTUAL_FIELD_OPERATOR_NOT_ALLOWED:${condition.field}:${condition.operator}`);
@@ -140,8 +164,7 @@ async function resolveVirtualCondition(collection: string, condition: SafeCondit
 
   if (condition.field === "key") {
     if (collection === "feature_requests") {
-      if (ObjectId.isValid(value)) return { _id: negate ? { $ne: new ObjectId(value) } : new ObjectId(value) };
-      return { featureRequestKey: negate ? { $ne: value } : value };
+      return featureKeyFilter(value, negate);
     }
     if (collection === "epics") {
       if (ObjectId.isValid(value)) return { _id: negate ? { $ne: new ObjectId(value) } : new ObjectId(value) };
@@ -204,6 +227,9 @@ async function convertValueForField(collection: string, field: string, value: un
 }
 
 async function conditionToFilter(collection: string, condition: SafeCondition): Promise<Filter<Document>> {
+  if (collection === "feature_requests" && condition.field === "featureRequestKey" && ["eq", "ne"].includes(condition.operator)) {
+    return featureKeyFilter(String(rawConditionValue(condition)), condition.operator === "ne");
+  }
   const virtual = await resolveVirtualCondition(collection, condition);
   if (virtual) return virtual;
 
@@ -222,6 +248,50 @@ async function buildFilter(action: DatabaseAction, caller: Caller, scope: string
   const requested = combineFilters(conditionFilters, action.logic ?? "AND");
   const enforced = await buildScopeFilter(action.collection, scope as "OWN" | "TEAM" | "ALL" | "ASSIGNED", caller);
   return combineFilters([requested, enforced], "AND");
+}
+
+// Suggestions are read-only evidence, never a replacement mutation filter.
+async function featureTitleSuggestions(action: DatabaseAction, caller: Caller, scope: string) {
+  if (action.collection !== "feature_requests" || action.conditions?.length !== 1) return null;
+  const condition = action.conditions[0];
+  if (!["title", "key", "featureRequestKey"].includes(condition.field)
+    || !["eq", "contains"].includes(condition.operator)) return null;
+  const text = condition.stringValue?.trim();
+  if (!text || text.length > 240 || ObjectId.isValid(text)
+    || /^(?:FR|feature(?:\s+request)?)\s*[-#]?\s*\d+$/i.test(text)) return null;
+  const db = await getDb();
+  const enforced = await buildScopeFilter("feature_requests", scope as "OWN" | "TEAM" | "ALL" | "ASSIGNED", caller);
+  const projection = { ...projectionFor(action), _id: 1, featureRequestKey: 1, title: 1 };
+  const tokens = [...new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
+    .filter((word) => !["the", "a", "an", "of", "for", "and"].includes(word));
+  const searches: Array<{ matchType: string; filter: Filter<Document> }> = [
+    { matchType: "exact_title", filter: { title: { $regex: `^${escapeRegex(text)}$`, $options: "i" } } },
+    { matchType: "partial_title", filter: { title: { $regex: escapeRegex(text), $options: "i" } } },
+  ];
+  if (tokens.length >= 2 && tokens.length <= 12) searches.push({
+    matchType: "title_keywords",
+    filter: { $and: tokens.map((word) => ({ title: { $regex: `\\b${escapeRegex(word)}\\b`, $options: "i" } })) },
+  });
+  // If all keywords fail, allow one differing word without any synonym or
+  // feature-specific mappings. Keep at least two words and every numeric token.
+  if (tokens.length >= 3 && tokens.length <= 12 && tokens.some((word) => !/\d/.test(word))) searches.push({
+    matchType: "partial_keywords",
+    filter: { $or: tokens.flatMap((word, omitted) => /\d/.test(word) ? [] : [{
+      $and: tokens.filter((_, index) => index !== omitted)
+        .map((token) => ({ title: { $regex: `\\b${escapeRegex(token)}\\b`, $options: "i" } })),
+    }]) },
+  });
+  for (const search of searches) {
+    const rows = await db.collection("feature_requests")
+      .find(combineFilters([search.filter, enforced]), { projection }).sort({ _id: 1 }).limit(6).toArray();
+    if (rows.length) return {
+      matches: rows.slice(0, 5), matchType: search.matchType,
+      requiresClarification: rows.length > 1 || search.matchType !== "exact_title",
+      hasMore: rows.length > 5,
+      note: "Show the stored title, featureRequestKey and _id. For partial matches, describe them as possible matches. Ask the user to choose when ambiguous; use the confirmed ID for any later action.",
+    };
+  }
+  return null;
 }
 
 async function fieldToSet(collection: string, field: FieldChange, caller: Caller): Promise<Record<string, unknown>> {
@@ -560,13 +630,13 @@ async function calculateReleaseReadiness(action: DatabaseAction) {
   // Keep the formula visible, but allow an explicit seed-only acceptance fixture to reproduce those
   // mandated demo values deterministically. Production records should omit evaluationFixture.
   const fixture = release.evaluationFixture;
+  const failedTests = testEvidence.filter((test) => test.result === "FAIL");
   const fixtureBlocked = Boolean(openCriticalBugs.length || failedTests.length);
   const score = fixture && typeof fixture.blockedScore === "number" && typeof fixture.clearedScore === "number"
     ? (fixtureBlocked ? Number(fixture.blockedScore) : Number(fixture.clearedScore))
     : formulaScore;
 
   const band = score >= 80 ? "READY" : score >= 50 ? "AT_RISK" : "NOT_READY";
-  const failedTests = testEvidence.filter((test) => test.result === "FAIL");
   const notRunTests = testEvidence.filter((test) => test.result === "NOT_RUN");
   const incompleteTasks = tasks.filter((task) => task.status !== "DONE");
   const blockers: Array<Record<string, unknown>> = [];
@@ -633,7 +703,12 @@ async function enforceReleaseMutationPreconditions(
 }
 
 export async function executeDatabaseAction(agent: AgentName, caller: Caller, action: DatabaseAction) {
-  const { rule, maxLimit, maxBulkUpdate } = authorize(agent, caller, action);
+  // A requested read size is a planning hint. Clamp it before authorization,
+  // while invalid numbers and all write limits still go through the guard.
+  if (action.operation === "find" && Number.isSafeInteger(action.limit) && action.limit! > MAX_READ_LIMIT) {
+    action = { ...action, limit: MAX_READ_LIMIT };
+  }
+  const { rule, maxLimit, maxOffset, maxBulkUpdate } = authorize(agent, caller, action);
   const db = await getDb();
 
   if (action.operation === "calculate") {
@@ -651,12 +726,20 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, ac
   let result: unknown;
 
   if (action.operation === "find") {
+    const offset = action.offset ?? 0;
     const cursor = collection.find(filter, { projection: projectionFor(action) });
-    if (action.sortField) cursor.sort({ [action.sortField]: action.sortDirection === "asc" ? 1 : -1 });
-    const rows = await cursor.limit(limit + 1).toArray();
+    const sort: Record<string, 1 | -1> = action.sortField
+      ? { [action.sortField]: action.sortDirection === "asc" ? 1 : -1 } : { _id: 1 };
+    // A unique tie-breaker prevents equal sort values from shuffling between pages.
+    if (!("_id" in sort)) sort._id = 1;
+    const rows = await cursor.sort(sort).skip(offset).limit(limit + 1).toArray();
     const hasMore = rows.length > limit;
     const items = hasMore ? rows.slice(0, limit) : rows;
-    result = { items, returned: items.length, limit, hasMore };
+    const nextOffset = hasMore && offset + items.length <= maxOffset ? offset + items.length : null;
+    result = {
+      items, returned: items.length, limit, offset, hasMore, nextOffset,
+      ...(hasMore && nextOffset === null ? { paginationNote: "Narrow the filters to retrieve additional records beyond the pagination limit." } : {}),
+    };
   } else if (action.operation === "find_one") {
     result = await collection.findOne(filter, { projection: projectionFor(action) });
   } else if (action.operation === "count") {
@@ -720,5 +803,8 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, ac
     throw new Error(`UNSUPPORTED_OPERATION:${action.operation}`);
   }
 
+  const emptyRead = action.operation === "find_one" ? result === null
+    : action.operation === "find" && !(action.offset ?? 0) && (result as { returned: number }).returned === 0;
+  if (emptyRead) result = await featureTitleSuggestions(action, caller, rule.scope) ?? result;
   return { ok: true, agent, collection: action.collection, operation: action.operation, result };
 }

@@ -12,16 +12,19 @@ export function schemaContext(agent: AgentName, role: Role): string {
       .map(([name, config]) => `${name}:${config.type}`)
       .join(", ");
     const virtual = Object.entries(schema.virtualFields ?? {})
-      .map(([name, config]) => `${name}:${config.type}(virtual)`)
+      .map(([name, config]) => `${name}:${config.type}(virtual; eq/ne only)${config.description ? `: ${config.description}` : ""}`)
       .join(", ");
     const relationships = Object.entries(schema.relationships ?? {})
       .map(([from, to]) => `${from}->${to}`)
       .join(", ");
+    const needsReview = role === "PRODUCT_MANAGER" && ["epics", "user_stories"].includes(collection);
+    const operations = needsReview ? rule.ops.filter((op) => !["insert_one", "insert_many"].includes(op)) : rule.ops;
 
     return [
       `COLLECTION ${collection}`,
       `purpose=${schema.description}`,
-      `operations=${rule.ops.join("|")}`,
+      `operations=${operations.join("|")}`,
+      needsReview ? "creation=preview_requirements_draft followed by the PM's Approve and save button; direct inserts are blocked" : "",
       `scope=${rule.scope}`,
       `fields=${fields}`,
       `selectableFields=${listSelectableFields(collection).join("|")} (selectFieldsCsv for find/find_one only; omit on mutations)`,

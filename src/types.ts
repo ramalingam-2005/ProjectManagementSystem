@@ -72,6 +72,7 @@ export interface DatabaseAction {
   conditions?: SafeCondition[];
   logic?: "AND" | "OR";
   limit?: number;
+  offset?: number;
   sortField?: string;
   sortDirection?: "asc" | "desc";
   selectFields?: string[];

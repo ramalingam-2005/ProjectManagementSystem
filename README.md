@@ -27,7 +27,7 @@ Access to an agent does not imply write access. Final authorization is always:
 - Groq-facing database tool schema is now intentionally **flat** to reduce `tool_use_failed` errors.
 - Nested conditions/fields are passed as JSON strings, parsed and validated server-side.
 - Developer OWN/ASSIGNED scope rejects attempts to target another developer explicitly.
-- `insert_many` is supported for AI-drafted user stories.
+- PM-generated epics and user stories require review and explicit approval before insertion.
 - DRAFT epics/stories get system-generated public keys when missing.
 - `generatedByAI`, creator and timestamps are system-controlled fields.
 - Task creation checks that the source story is APPROVED.
@@ -57,6 +57,25 @@ npm run dev
 ```
 
 Open `http://localhost:3000`.
+
+## PM draft review
+
+1. Ask the assistant to draft an epic and user stories for an existing feature request.
+2. Review the displayed epic, stories, acceptance criteria, priorities and story points.
+3. Choose **Request changes** and describe the changes in chat. The assistant presents a replacement draft; the previous version can no longer be approved.
+4. Choose **Approve and save** to insert the exact reviewed version, or **Discard** to abandon it.
+
+New epic and story records remain `DRAFT`. Approving existing stories for engineering work is a separate PM action. A chat message such as "yes" or "save it" does not replace the **Approve and save** button.
+
+The backend blocks direct PM inserts through the database tool. Reviews are tied to the caller, conversation and draft digest, and expire after one hour. Approval saves the epic, stories, audit entry and receipt in one MongoDB transaction; retrying the same approval returns the existing receipt. This requires MongoDB transactions, supported by the Atlas deployment used here.
+
+Pending business records are not inserted into `epics` or `user_stories`. The `requirements_reviews` collection stores review metadata and, after approval, a save receipt. The existing chat checkpoint system still stores conversation/tool history. Review controls use the application's existing caller resolution; production authentication remains a separate requirement.
+
+Run the approval regression tests without connecting to Atlas:
+
+```powershell
+npm test
+```
 
 ## Seed data for acceptance testing
 
@@ -151,7 +170,7 @@ user: u-pm-1
 Draft user stories for the bulk CSV upload feature request
 ```
 
-Expected: DRAFT epic/story records only; no engineering tasks are created.
+Expected: a review preview with no epic/story inserts. Request changes if needed, then choose **Approve and save**. Only that action creates DRAFT epic/story records; no engineering tasks are created.
 
 Release:
 

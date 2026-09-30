@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { RequirementsReviewCard } from "./components/requirements-review";
+import type { RequirementsReview } from "@/src/requirements-review";
 
-type Row = { who: "You" | "Assistant"; text: string; error?: boolean; trace?: unknown[] };
+type Row = { who: "You" | "Assistant"; text: string; error?: boolean; trace?: unknown[]; requirementsReview?: RequirementsReview };
 
 function createSessionId() {
   // getRandomValues also works when the dev app is opened over LAN HTTP.
@@ -20,6 +22,8 @@ export default function Home() {
   const [sessionId, setSessionId] = useState("");
   const [copied, setCopied] = useState<number | null>(null);
   const [copyError, setCopyError] = useState("");
+  const [review, setReview] = useState<RequirementsReview | null>(null);
+  const [reviewNeedsRefresh, setReviewNeedsRefresh] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -39,6 +43,8 @@ export default function Home() {
     setMessage("");
     setSessionId(createSessionId());
     setCopyError("");
+    setReview(null);
+    setReviewNeedsRefresh(false);
     composerRef.current?.focus();
   }
 
@@ -48,23 +54,52 @@ export default function Home() {
     setMessage("");
     setRows((current) => [...current, { who: "You", text: query }]);
     setBusy(true);
+    if (review) setReviewNeedsRefresh(true);
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ userId: identity, sessionId, message: query }),
+        body: JSON.stringify({ userId: identity, sessionId, message: query, requirementsReview: review ?? undefined }),
       });
       const json = await response.json();
+      if (response.ok && json.requirementsReview) {
+        setReview(json.requirementsReview);
+        setReviewNeedsRefresh(false);
+      } else if (review && (response.status === 409 || response.status === 403)) {
+        setReview(null);
+        setReviewNeedsRefresh(false);
+      }
       setRows((current) => [...current, {
         who: "Assistant",
         text: json.response || json.error || "No response received. Please try again.",
         error: !response.ok || json.ok === false,
         trace: Array.isArray(json.trace) ? json.trace : undefined,
+        requirementsReview: json.requirementsReview,
       }]);
     } catch {
       setRows((current) => [...current, { who: "Assistant", text: "We couldn't connect. Check your connection and try sending your message again.", error: true }]);
       setMessage(query);
     } finally { setBusy(false); composerRef.current?.focus(); }
+  }
+
+  async function decideReview(action: "approve" | "discard") {
+    if (!review || busy || !identity || (action === "approve" && reviewNeedsRefresh)) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/requirements/review", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: identity, sessionId, action, review }),
+      });
+      const json = await response.json();
+      setRows((current) => [...current, {
+        who: "Assistant", text: json.response || json.error || "Could not confirm the review result.",
+        error: !response.ok || json.ok === false,
+      }]);
+      if (response.ok && json.ok) { setReview(null); setReviewNeedsRefresh(false); }
+      else if (response.status === 409 || response.status === 403) { setReview(null); setReviewNeedsRefresh(false); }
+    } catch {
+      setRows((current) => [...current, { who: "Assistant", text: "Could not confirm the result. Retry this same review to check whether it was saved.", error: true }]);
+    } finally { setBusy(false); }
   }
 
   return (
@@ -92,6 +127,13 @@ export default function Home() {
           {rows.map((row, index) => <article key={index} className={`message ${row.who === "You" ? "me" : "ai"} ${row.error ? "message-error" : ""}`}>
             <div className="message-label"><span className="avatar" aria-hidden="true">{row.who === "You" ? "Y" : "✳"}</span><strong>{row.who === "You" ? "You" : "Workspace assistant"}</strong>{row.error && <span className="error-label">Request unsuccessful</span>}</div>
             {row.who === "You" ? <div className="user-text">{row.text}</div> : <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a>, table: ({ children }) => <div className="table-scroll"><table>{children}</table></div> }}>{row.text}</ReactMarkdown></div>}
+            {row.requirementsReview && <RequirementsReviewCard
+              review={row.requirementsReview} active={review?.id === row.requirementsReview.id}
+              busy={busy} needsRefresh={reviewNeedsRefresh}
+              onApprove={() => { void decideReview("approve"); }}
+              onDiscard={() => { void decideReview("discard"); }}
+              onEdit={() => { setReviewNeedsRefresh(true); composerRef.current?.focus(); }}
+            />}
             {row.who !== "You" && <div className="message-actions"><button onClick={async () => { try { await navigator.clipboard.writeText(row.text); setCopied(index); setCopyError(""); } catch { setCopyError("Copy is unavailable here. Select the response text to copy it."); } }}>{copied === index ? "Copied ✓" : "Copy response"}</button>{!!row.trace?.length && <details><summary>Action details</summary><pre className="trace">{JSON.stringify(row.trace, null, 2)}</pre></details>}</div>}
           </article>)}
           {busy && <div className="thinking" role="status"><span className="assistant-symbol" aria-hidden="true">✳</span><span>Working on your request</span><span className="thinking-dots" aria-hidden="true">•••</span></div>}

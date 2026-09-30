@@ -80,7 +80,7 @@ async function auditRefusal(agent: AgentName, caller: Caller, generatedAction: u
   });
 }
 
-export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: AgentTrace[]) {
+export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: AgentTrace[], reviewInProgress = false) {
   const collections = getAllowedCollections(agent, caller.role);
   if (!collections.length) throw new Error(`NO_COLLECTIONS_ALLOWED:${agent}:${caller.role}`);
 
@@ -96,7 +96,10 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
       'JSON array of safe conditions, e.g. [{"field":"status","operator":"eq","stringValue":"APPROVED"}]. Use numberValue for numeric fields.',
     ),
     logic: z.enum(["AND", "OR"]).optional(),
-    limit: z.number().int().min(1).max(25).optional(),
+    // Let the backend bound numeric paging hints so an oversized model request
+    // cannot fail provider validation before our guardrails can handle it.
+    limit: z.number().optional().describe("Requested page size for find; default 10. The backend caps each page at 25 records. Use nextOffset from the result to fetch more."),
+    offset: z.number().optional().describe("For find only. Start at 0; continue with the exact nextOffset returned by the previous page, keeping the same filters, limit and sort."),
     sortField: z.string().optional(),
     sortDirection: z.enum(["asc", "desc"]).optional(),
     selectFieldsCsv: z.string().optional().describe("For find/find_one only. Comma-separated names from selectableFields. Omit for mutations. To read task blocker details select blocker, not blocked, blockerReason or dotted blocker paths."),
@@ -107,12 +110,17 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
       'For insert_many only. JSON array of objects shaped like {"fields":[...]}. Maximum 5 documents.',
     ),
     metric: z.enum(["developer_workload", "sprint_overload_summary", "release_readiness"]).optional(),
-    reason: z.string().min(3).max(180),
+    reason: z.string().trim().min(3).max(180).optional().describe(
+      "Required for insert and update operations: briefly explain the requested change. Optional for reads and calculations.",
+    ),
   });
 
   return tool(
     async (input) => {
       try {
+        if (reviewInProgress && !["find", "find_one", "count"].includes(input.operation)) {
+          throw new Error("PENDING_DRAFT_REQUIRES_PREVIEW:Revise the unsaved draft using preview_requirements_draft.");
+        }
         const conditions = parseJsonArray(
           input.conditionsJson,
           z.array(ConditionSchema).max(12),
@@ -144,6 +152,7 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
           conditions,
           logic: input.logic,
           limit: input.limit,
+          offset: input.offset,
           sortField: input.sortField,
           sortDirection: input.sortDirection,
           // Only reads use projections; model-supplied selections cannot affect mutations.
@@ -153,7 +162,10 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
           fields,
           documents,
           metric: input.metric,
-          reason: input.reason,
+          // Reads need no model-generated justification. Never supply a fallback for writes;
+          // the shared guard must still reject mutations without an explicit reason.
+          reason: input.reason ?? (["find", "find_one", "count", "calculate"].includes(input.operation)
+            ? `Read ${input.collection} using ${input.operation}.` : ""),
         };
 
         const result = await executeDatabaseAction(agent, caller, action);
@@ -175,9 +187,14 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
         `Single guarded database action tool for the ${agent} agent.`,
         "The tool schema is intentionally flat for reliable Groq function calling.",
         "Never emit raw MongoDB syntax.",
+        "Include reason for every insert or update. It may be omitted for reads and calculations.",
+        "Find returns at most 25 records per page with hasMore and nextOffset. Continue with nextOffset for more results; a larger limit does not retrieve more than one page.",
+        "Prefer the default projection for lists. Select long descriptions or logs only when the user needs those details.",
         "Use conditionsJson, fieldsJson and documentsJson only as JSON strings matching the examples in their descriptions.",
         "Use numberValue for numeric fields (for example sprintNumber and storyPoints), never stringValue.",
         "For public identifiers use condition field=key with operator=eq.",
+        "Never invent a key from descriptive text. For feature text search use operation=find, logic=OR, and contains conditions on title and description; if empty, retry meaningful partial keywords. Use count for totals and approved virtual relationship filters for joins. Raw $lookup pipelines are not an input to this tool.",
+        "For feature titles use title and preserve the user's spelling. Empty title/key reads may return matches (exact title, partial title or shared keywords). Present these candidates using their stored names and IDs; do not treat suggestions as permission to change a record.",
         "For developer identity use virtual condition field=assignee with operator=eq. Developers should not provide an assignee filter for their own records because OWN scope is injected by the backend.",
         "Deletes, drops, raw aggregation and unrestricted queries are not available.",
         "The backend independently validates role, collection, operation, field, record scope, business rules and mutation limits.",

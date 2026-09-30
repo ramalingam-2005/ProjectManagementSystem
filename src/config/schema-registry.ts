@@ -19,7 +19,7 @@ export const COLLECTION_SCHEMAS = {
       updatedAt: { type: "date", queryable: true, selectable: true },
     },
     virtualFields: {
-      key: { type: "string", queryable: true, description: "Public identifier alias. Resolves featureRequestKey when present or a Mongo _id string." },
+      key: { type: "string", queryable: true, description: "Public identifier alias. Exact stored keys take priority; FR-113, feature-113 and feature request 113 can resolve the same feature. Also accepts Mongo _id." },
     },
     defaultProjection: ["featureRequestKey", "title", "priority", "status", "source", "updatedAt"],
   },

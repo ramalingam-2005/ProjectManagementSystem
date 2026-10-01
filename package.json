@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ./tests/register-ts.cjs tests/requirements-review.test.cjs",
+    "test": "node --require ./tests/register-ts.cjs tests/run.cjs",
+    "test:50": "node --require ./tests/register-ts.cjs tests/acceptance-50.test.cjs",
+    "test:integration": "node --env-file=.env.local --require ./tests/register-ts.cjs tests/native-mongo.integration.cjs",
     "seed": "node --env-file=.env.local scripts/seed-demo.mjs",
     "seed:evaluation": "node --env-file=.env.local scripts/seed-evaluation.mjs"
   },

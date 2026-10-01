@@ -4,6 +4,7 @@ export interface Rule {
   ops: DbOperation[];
   scope: Scope;
   mutableFields?: string[];
+  creationReview?: boolean;
 }
 
 type RoleRules = Partial<Record<string, Rule>>;
@@ -16,14 +17,15 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
         scope: "ALL",
         mutableFields: ["featureRequestKey", "productId", "title", "description", "source", "sourceDetail", "priority", "status"],
       },
-      // The AI may persist a DRAFT epic as part of requirement drafting. Engineering execution still
-      // starts only after PM approval; task creation remains an EL responsibility.
+      // Creation must pass through the PM review service.
       epics: {
+        creationReview: true,
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ALL",
         mutableFields: ["epicKey", "featureRequestId", "title", "description", "status"],
       },
       user_stories: {
+        creationReview: true,
         ops: ["find", "find_one", "count", "insert_one", "insert_many", "update_one", "update_many"],
         scope: "ALL",
         mutableFields: ["storyKey", "epicId", "title", "userStory", "acceptanceCriteria", "storyPoints", "priority", "status"],
@@ -181,7 +183,6 @@ export const NEVER_ALLOWED = new Set([
   "dropDatabase",
   "replace_one",
   "renameCollection",
-  "aggregate",
   "bulkWrite",
   "$where",
   "$function",

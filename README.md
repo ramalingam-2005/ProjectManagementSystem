@@ -24,8 +24,9 @@ Access to an agent does not imply write access. Final authorization is always:
 
 ## Important v5 fixes
 
-- Groq-facing database tool schema is now intentionally **flat** to reduce `tool_use_failed` errors.
-- Nested conditions/fields are passed as JSON strings, parsed and validated server-side.
+- All agents share native MongoDB structured reads: `find`, `findOne`, `countDocuments`, and approved `aggregate` pipelines.
+- Recursive validation checks filters, stages, fields, and every `$lookup` target. Record scopes apply to the base collection and each join.
+- Existing mutation/calculation contracts and approval services remain guarded; their conditions/fields use validated JSON strings.
 - Developer OWN/ASSIGNED scope rejects attempts to target another developer explicitly.
 - PM-generated epics and user stories require review and explicit approval before insertion.
 - DRAFT epics/stories get system-generated public keys when missing.
@@ -34,7 +35,10 @@ Access to an agent does not imply write access. Final authorization is always:
 - Sprint workload and team overload are deterministic backend calculations.
 - Release readiness is backend-calculated; sign-offs are role guarded and blocked by open Critical bugs.
 - Refused tool actions are written to `audit_logs`.
-- Groq output is capped and only recent conversation messages are sent to reduce free-tier usage.
+- Groq requests use a size budget, compact history and capped output; completed tool actions are preserved when a model request is retried.
+- All agents compact repeated tool data without losing records and can finish from the collected evidence with tools disabled when the full planning context is too large.
+- Simple record lists fetch every page up to 500 records and render consistent tables without a model call.
+- Engineering Lead task assignments resolve assignees by name through the backend; ID-only follow-ups stay with the previous specialist.
 
 ## Configure
 
@@ -71,11 +75,34 @@ The backend blocks direct PM inserts through the database tool. Reviews are tied
 
 Pending business records are not inserted into `epics` or `user_stories`. The `requirements_reviews` collection stores review metadata and, after approval, a save receipt. The existing chat checkpoint system still stores conversation/tool history. Review controls use the application's existing caller resolution; production authentication remains a separate requirement.
 
-Run the approval regression tests without connecting to Atlas:
+Run approval, native-query, and multi-agent security tests without connecting to Atlas:
 
 ```powershell
 npm test
 ```
+
+Run the 50 additional acceptance cases on their own:
+
+```powershell
+npm run test:50
+```
+
+These cover draft validation, sessions, role permissions, native query validation,
+read execution and the review API using in-memory fixtures. They also run as part
+of `npm test`. See [the 50-case test report](docs/TEST_CASES_50.md).
+
+`npm test` also covers routing, conversation size limits, complete lists, rendered
+table headings, task creation from approved stories, guarded task assignments,
+and context overflow recovery across all five agents.
+See [the chat fix report](docs/CHAT_CONTEXT_FIX.md).
+
+For explicit read-only integration checks against the configured database:
+
+```powershell
+npm run test:integration
+```
+
+This uses `TEST_USER_ID` (default `u-pm-1`) and captures audit entries in memory; it does not seed or change records. See [the native MongoDB implementation report](docs/NATIVE_MONGODB_REFACTOR.md).
 
 ## Seed data for acceptance testing
 
@@ -107,7 +134,7 @@ The task document contains a scoring inconsistency: its readiness formula says a
 ```text
 User
  -> server-resolved caller
- -> LLM supervisor router
+ -> explicit list routing or LLM supervisor router
  -> specialist agent
  -> one guarded database-action tool
  -> policy + guardrails

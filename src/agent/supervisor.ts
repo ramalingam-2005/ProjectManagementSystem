@@ -4,6 +4,7 @@ import type { Caller } from "@/src/types";
 import type { RequirementsReview } from "@/src/requirements-review";
 import { getRequirementsReviewService } from "@/src/services/requirements-review.service";
 import { chatThreadId, safeSessionId } from "@/src/utils/chat-session";
+import { recordListIntent } from "@/src/agent/record-list";
 
 export async function runChat(input: {
   caller: Caller;
@@ -20,6 +21,7 @@ export async function runChat(input: {
   const threadId = chatThreadId(input.caller, sessionId);
   if (input.requirementsReview && input.caller.role !== "PRODUCT_MANAGER") throw new Error("REVIEW_PM_ONLY");
   const service = agent === "REQUIREMENTS" && input.caller.role === "PRODUCT_MANAGER"
+    && (!recordListIntent(message) || input.requirementsReview)
     ? await getRequirementsReviewService() : undefined;
   const saved = service ? await service.savedResult(input.caller, threadId) : undefined;
   const revision = service ? await service.begin(input.caller, threadId, input.requirementsReview) : undefined;

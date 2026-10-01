@@ -1,6 +1,7 @@
 import { ObjectId, type Filter } from "mongodb";
 import { getDb } from "@/src/db/mongodb";
 import type { Caller, Scope } from "@/src/types";
+import { MONGO_LIMITS } from "@/src/security/mongo-policy";
 
 export async function buildScopeFilter(collection: string, scope: Scope, caller: Caller): Promise<Filter<Record<string, unknown>>> {
   if (scope === "ALL") return {};
@@ -9,10 +10,11 @@ export async function buildScopeFilter(collection: string, scope: Scope, caller:
   const db = await getDb();
 
   if (scope === "OWN") {
+    if (collection === "feature_requests") return { requestedBy: callerId };
     if (collection === "tasks") return { assigneeId: callerId };
     if (collection === "sprints") return { "capacities.developerId": callerId };
     if (collection === "user_stories") {
-      const storyIds = await db.collection("tasks").distinct("storyId", { assigneeId: callerId });
+      const storyIds = await db.collection("tasks").distinct("storyId", { assigneeId: callerId }, { maxTimeMS: MONGO_LIMITS.maxTimeMS });
       return { _id: { $in: storyIds.filter((id): id is ObjectId => id instanceof ObjectId) } };
     }
     return { ownerId: callerId };
@@ -21,7 +23,7 @@ export async function buildScopeFilter(collection: string, scope: Scope, caller:
   if (scope === "ASSIGNED") {
     if (collection === "bugs") return { assigneeId: callerId };
     if (collection === "test_cases") {
-      const testCaseIds = await db.collection("bugs").distinct("sourceTestCaseId", { assigneeId: callerId });
+      const testCaseIds = await db.collection("bugs").distinct("sourceTestCaseId", { assigneeId: callerId }, { maxTimeMS: MONGO_LIMITS.maxTimeMS });
       return { _id: { $in: testCaseIds.filter((id): id is ObjectId => id instanceof ObjectId) } };
     }
     return { assigneeId: callerId };
@@ -31,7 +33,7 @@ export async function buildScopeFilter(collection: string, scope: Scope, caller:
   // does not require a teamId field on every record.
   if (scope === "TEAM") {
     const developerIds = await db.collection("users")
-      .find({ reportsToUserId: callerId, active: { $ne: false } }, { projection: { _id: 1 } })
+      .find({ reportsToUserId: callerId, active: { $ne: false } }, { projection: { _id: 1 }, maxTimeMS: MONGO_LIMITS.maxTimeMS })
       .map((user) => user._id)
       .toArray();
 
@@ -42,8 +44,8 @@ export async function buildScopeFilter(collection: string, scope: Scope, caller:
     }
     if (collection === "bugs") return { assigneeId: { $in: developerIds } };
     if (collection === "sprints") return { "capacities.developerId": { $in: developerIds } };
-    return {};
+    throw new Error(`SCOPE_NOT_SUPPORTED:${collection}:${scope}`);
   }
 
-  return {};
+  throw new Error(`SCOPE_NOT_SUPPORTED:${collection}:${scope}`);
 }

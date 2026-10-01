@@ -1,8 +1,9 @@
 import { getCollectionSchema, listQueryableFields, listSelectableFields } from "@/src/config/schema-registry";
 import { getRolePolicy } from "@/src/security/policy";
+import { MONGO_LIMITS } from "@/src/security/mongo-policy";
 import type { AgentName, Caller, DatabaseAction, FieldChange } from "@/src/types";
 
-export const MAX_READ_LIMIT = 25;
+export const MAX_READ_LIMIT = MONGO_LIMITS.results;
 const MAX_OFFSET = 10_000;
 const MAX_BULK_UPDATE = 20;
 const MAX_CONDITIONS = 12;
@@ -25,6 +26,7 @@ function assertMutationFields(fields: FieldChange[] | undefined, allowedFields: 
 }
 
 export function authorize(agent: AgentName, caller: Caller, action: DatabaseAction) {
+  if (!caller.active) throw new Error("USER_INACTIVE");
   const rolePolicy = getRolePolicy(agent, caller.role);
   const rule = rolePolicy[action.collection];
 
@@ -32,8 +34,7 @@ export function authorize(agent: AgentName, caller: Caller, action: DatabaseActi
   if (!getCollectionSchema(action.collection)) throw new Error(`UNKNOWN_COLLECTION_SCHEMA:${action.collection}`);
   if (!rule.ops.includes(action.operation)) throw new Error(`OPERATION_NOT_ALLOWED:${action.operation}`);
 
-  if (caller.role === "PRODUCT_MANAGER" && ["epics", "user_stories"].includes(action.collection)
-    && ["insert_one", "insert_many"].includes(action.operation)) {
+  if (rule.creationReview && ["insert_one", "insert_many"].includes(action.operation)) {
     throw new Error("PM_REVIEW_REQUIRED:Use preview_requirements_draft. Only the PM's Approve and save action can insert reviewed epics and stories.");
   }
 

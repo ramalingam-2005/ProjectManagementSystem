@@ -7,6 +7,7 @@ export interface RecordListIntent {
   label: string;
   agents: AgentName[];
   columns: Column[];
+  sprintNumber?: number;
 }
 
 const LISTS: Record<string, RecordListIntent> = {
@@ -23,11 +24,27 @@ const LISTS: Record<string, RecordListIntent> = {
 
 export function recordListIntent(message: string): RecordListIntent | undefined {
   const normalized = message.trim().toLowerCase().replace(/_/g, " ").replace(/\s+/g, " ");
+  // Match the entire request so extra filters or actions cannot be discarded.
+  const sprintTasks = normalized.match(/^(?:please )?(?:show|list|display|get)(?: me)? (?:all )?(?:the )?tasks (?:in|for) (?:the )?sprint (?:#\s*)?(\d+)(?: please)?[.!?]*$/);
+  if (sprintTasks) {
+    const sprintNumber = Number(sprintTasks[1]);
+    if (!Number.isSafeInteger(sprintNumber)) return undefined;
+    return {
+      ...LISTS.tasks, label: `Tasks in Sprint ${sprintNumber}`, sprintNumber,
+      columns: [...LISTS.tasks.columns.slice(0, 2), ["assigneeId", "Assignee ID"], ...LISTS.tasks.columns.slice(2)],
+    };
+  }
   const entity = normalized.match(/^(?:please )?(?:show|list|display|get)(?: me)? (?:all )?(?:the )?([a-z ]+?)(?: please)?[.!?]*$/)?.[1];
   return entity && Object.hasOwn(LISTS, entity) ? LISTS[entity] : undefined;
 }
 
 export const MAX_LIST_RECORDS = 500;
+
+function readFailure(label: string, error: string = ""): string {
+  return /COLLECTION_NOT_ALLOWED|OPERATION_NOT_ALLOWED|USER_INACTIVE/.test(error)
+    ? `Your account does not have permission to list ${label.toLowerCase()}.`
+    : `I couldn't retrieve ${label.toLowerCase()}. Please try again.`;
+}
 
 function cell(value: unknown): string {
   if (value === undefined || value === null) return "—";
@@ -39,20 +56,36 @@ function cell(value: unknown): string {
 // Pagination and formatting are deterministic. Each page still goes through the
 // same guarded tool, record scopes, response limits and audit as a model read.
 export async function readRecordList(intent: RecordListIntent, invoke: (action: MongoReadAction) => Promise<string>): Promise<string> {
+  let filter: MongoReadAction["filter"] = {};
+  if (intent.sprintNumber !== undefined) {
+    const label = `Sprint ${intent.sprintNumber}`;
+    const output = JSON.parse(await invoke({
+      collection: "sprints", operation: "find", filter: { sprintNumber: intent.sprintNumber },
+      projection: { _id: 1, name: 1, sprintNumber: 1 }, sort: { _id: 1 }, limit: 2,
+    }));
+    if (!output.ok) return readFailure(intent.label, output.error);
+    const matches = output.result.items;
+    if (!matches.length) return `${label} was not found within your access.`;
+    if (matches.length > 1 || output.result.hasMore) {
+      return `Multiple sprints match ${label} within your access. Please specify a sprint ID.\n\n`
+        + matches.map((sprint: Record<string, unknown>) => `- ${cell(sprint.name)}: ${cell(sprint._id)}`).join("\n");
+    }
+    // Never fall back to an unfiltered task read if sprint resolution fails.
+    if (typeof matches[0]._id !== "string" || !/^[a-f0-9]{24}$/i.test(matches[0]._id)) return readFailure(intent.label);
+    filter = { sprintId: matches[0]._id };
+  }
   const rows: Record<string, unknown>[] = [];
   let skip = 0;
   let complete = false;
   let failure = false;
   while (rows.length < MAX_LIST_RECORDS) {
     const output = JSON.parse(await invoke({
-      collection: intent.collection, operation: "find", filter: {},
+      collection: intent.collection, operation: "find", filter,
       projection: Object.fromEntries([ ["_id", 1], ...intent.columns.map(([field]) => [field, 1]) ]),
       sort: { _id: 1 }, limit: 25, skip,
     }));
     if (!output.ok) {
-      if (!rows.length) return /COLLECTION_NOT_ALLOWED|OPERATION_NOT_ALLOWED|USER_INACTIVE/.test(output.error ?? "")
-        ? `Your account does not have permission to list ${intent.label.toLowerCase()}.`
-        : `I couldn't retrieve ${intent.label.toLowerCase()}. Please try again.`;
+      if (!rows.length) return readFailure(intent.label, output.error);
       failure = true;
       break;
     }

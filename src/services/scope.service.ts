@@ -42,8 +42,7 @@ export async function buildScopeFilter(collection: string, scope: Scope, caller:
     if (collection === "tasks") {
       return { $or: [{ assigneeId: { $in: teamUserIds } }, { createdBy: callerId }] };
     }
-    if (collection === "bugs") return { assigneeId: { $in: developerIds } };
-    if (collection === "sprints") return { "capacities.developerId": { $in: developerIds } };
+    if (collection === "sprints") return { $or: [{ "capacities.developerId": { $in: developerIds } }, { createdBy: callerId }] };
     throw new Error(`SCOPE_NOT_SUPPORTED:${collection}:${scope}`);
   }
 

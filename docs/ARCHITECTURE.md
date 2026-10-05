@@ -13,10 +13,12 @@
 - PM / QA: read-only sprint/task visibility where the project permission matrix allows it.
 
 ### Bug Agent
-- QA: test/bug management and verification.
-- Developer: raise bugs; assigned bug reads; mark assigned bug FIX_READY.
-- EL: team bug visibility and reassignment.
+- QA: reports NEW unassigned bugs into the shared workspace backlog; maintains reports and verifies fixes; cannot assign developers.
+- Developer: raises unassigned bugs; reads assigned bugs; submits a fix summary to mark an assigned bug FIX_READY.
+- EL: sees all bugs, including unassigned bugs; assigns a specific active developer regardless of reporting relationship. No team-lead ownership field is used.
 - PM: read-only bug/test visibility.
+
+The shared bug backlog and lifecycle enforcement are documented in [BUG_WORKFLOW.md](BUG_WORKFLOW.md).
 
 ### Release Agent
 - EL: release engineering records and readiness.

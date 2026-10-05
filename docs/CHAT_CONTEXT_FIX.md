@@ -15,6 +15,14 @@ The Engineering Lead also reported that assigning TASK-207 to Rahul Kumar
 incorrectly requested a MongoDB ID. Supplying the quoted ID switched the
 conversation to Requirements, which refused access to tasks.
 
+"Show all tasks in Sprint 14" also bypassed the simple-list handler. The model
+repeated unfiltered sprint lookups (returning Sprint 8) and printed tool-call XML
+instead of retrieving and displaying tasks.
+
+An unrelated question, "tell me procedure to make a cup of coffee", returned
+"Not documented" because the router had to select one of the five specialists.
+The word "procedure" sent the request to the stored-document-only specialist.
+
 Groq documents an 8,000-token-per-minute free-plan limit for the configured
 GPT-OSS models; organization-specific limits are available in its console.
 See [Groq rate limits](https://console.groq.com/docs/rate-limits).
@@ -29,7 +37,22 @@ See [Groq rate limits](https://console.groq.com/docs/rate-limits).
   record scopes, 25-record pages and audits. Tables have separate header cells.
 - Lists fetch up to 500 records. A larger or interrupted list is explicitly
   marked incomplete. No model calls are needed to list records.
+- Numbered sprint task lists resolve the exact `sprintNumber`, then retain the
+  returned `sprintId` filter on every task page. Both reads enforce existing
+  role scopes. Missing, inaccessible or ambiguous sprints stop task retrieval.
+  Tables include the stored assignee ID; no access to user records is added.
+- Printed or malformed tool calls are never executed or returned as answers.
+  The shared answering step uses actual tool evidence, with an explicit
+  unfinished-work fallback if it cannot produce a valid response.
 - Viewing records does not begin or invalidate a PM draft review.
+- The router can return `OUT_OF_SCOPE` for unrelated questions. The supervisor
+  then returns a fixed explanation of supported workspace topics with no
+  specialist, business-tool or draft-service invocation. This routing outcome
+  adds no specialist permissions. It preserves the previous specialist and any
+  active draft review, including whether its approval controls were stale.
+- Explicit requests for stored internal guides still route to Documentation,
+  even when their topic is coffee. `Not documented` remains the response to an
+  in-scope documentation search with no relevant results.
 - HTTP 413/429 responses show readable messages instead of raw provider errors.
 - Task creation still requires a source story approved by a Product Manager.
 - Explicit task assignments route to Sprint/Task; ID-only replies retain the
@@ -50,7 +73,8 @@ See [Groq rate limits](https://console.groq.com/docs/rate-limits).
 
 ## Verification
 
-- `npm test`: **130 tests passed**, including the original 50 additional cases.
+- `npm test`: **181 tests passed**, including the original 50 additional cases,
+  database recovery, numbered sprint lists, sprint creation, scope routing and malformed tool-call regressions.
 - `npm run typecheck`: passed.
 - `npm run build`: passed, including TypeScript and production page generation.
 - A live replay used MongoDB and the configured `openai/gpt-oss-120b` model, with
@@ -77,6 +101,15 @@ See [Groq rate limits](https://console.groq.com/docs/rate-limits).
 - Generic context tests also cover Requirements, Bug, Release and Documentation,
   repeated subsets, nested records, reserved JSON keys, Unicode, partial read
   results and failure after a confirmed write. Full source evidence remains intact.
+- The Sprint 14 list regression uses an in-memory database through the chat graph
+  and guarded read service, with model calls disabled. It returns 27 permitted
+  tasks across two pages, excludes Sprint 8 and other-team tasks, and verifies
+  developer OWN scope, PM/QA access, missing/duplicate sprints and page failures.
+  This regression does not query or modify the live database.
+- A live router check classified the exact coffee question as `OUT_OF_SCOPE`
+  and "Find our office coffee-machine guide" as `DOCUMENTATION`. All database
+  access in that check used an in-memory fixture. Scope regressions also cover
+  all four roles, the chat API, mixed requests, ID follow-ups and pending drafts.
 
 The input estimate is conservative rather than an exact tokenizer count. Provider
 usage limits still apply to requests that need the model.

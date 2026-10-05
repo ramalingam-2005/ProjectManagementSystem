@@ -4,6 +4,7 @@ import { chatThreadId } from "@/src/utils/chat-session";
 import { resolveCaller } from "@/src/repositories/user.repository";
 import { RequirementsReviewSchema } from "@/src/requirements-review";
 import { getRequirementsReviewService } from "@/src/services/requirements-review.service";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
 
 export const runtime = "nodejs";
 
@@ -35,6 +36,8 @@ export async function POST(request: Request) {
     ].join("\n\n");
     return NextResponse.json({ ok: true, response, result });
   } catch (error) {
+    const databaseError = databaseErrorResponse(error);
+    if (databaseError) return NextResponse.json({ ok: false, code: databaseError.code, error: "The workspace database is temporarily unavailable. When it reconnects, retry this same review to check its saved result safely." }, { status: databaseError.status });
     const code = error instanceof Error ? error.message : "";
     const status = code === "REVIEW_PM_ONLY" ? 403 : code.startsWith("REVIEW_") ? 409
       : code === "USER_NOT_FOUND" ? 404 : code === "USER_INACTIVE" ? 403 : 500;

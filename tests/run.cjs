@@ -5,3 +5,8 @@ require("./routing.test.cjs");
 require("./model-context.test.cjs");
 require("./task-assignment.test.cjs");
 require("./context-budget.test.cjs");
+require("./database-connection.test.cjs");
+require("./sprint-task-list.test.cjs");
+require("./sprint-creation.test.cjs");
+require("./scope-routing.test.cjs");
+require("./bug-workflow.test.cjs");

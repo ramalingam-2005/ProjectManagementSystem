@@ -51,6 +51,7 @@ export default function Home() {
   async function send() {
     const query = message.trim();
     if (!query || busy || !identity || !sessionId) return;
+    const reviewWasStale = reviewNeedsRefresh;
     setMessage("");
     setRows((current) => [...current, { who: "You", text: query }]);
     setBusy(true);
@@ -65,6 +66,9 @@ export default function Home() {
       if (response.ok && json.requirementsReview) {
         setReview(json.requirementsReview);
         setReviewNeedsRefresh(false);
+      } else if (response.ok && json.requirementsReviewUnchanged === true) {
+        // An unrelated detour cannot make an already-stale review approvable.
+        setReviewNeedsRefresh(reviewWasStale);
       } else if (review && (response.status === 409 || response.status === 403)) {
         setReview(null);
         setReviewNeedsRefresh(false);

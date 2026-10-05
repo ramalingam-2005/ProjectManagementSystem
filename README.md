@@ -39,6 +39,10 @@ Access to an agent does not imply write access. Final authorization is always:
 - All agents compact repeated tool data without losing records and can finish from the collected evidence with tools disabled when the full planning context is too large.
 - Simple record lists fetch every page up to 500 records and render consistent tables without a model call.
 - Engineering Lead task assignments resolve assignees by name through the backend; ID-only follow-ups stay with the previous specialist.
+- Sprint creation uses `fieldsJson` for `insert_one`, with backend-derived two-week dates from the preceding sprint. Payload errors can be corrected internally; see [sprint creation](docs/SPRINT_CREATION_FIX.md).
+- Unrelated questions receive a workspace-scope explanation without invoking a specialist or business tools. `Not documented` is reserved for unsuccessful workspace documentation searches.
+- Bugs enter a shared backlog as NEW with `assigneeId: null`; no `teamLeadId` is required or stored. Every Engineering Lead sees all bugs and can assign an active developer. QA reports and verifies; developers submit fixes. See [bug workflow](docs/BUG_WORKFLOW.md).
+- QA bug creation asks for the source test case and, when needed, release/attempt. The bug and selected execution's `linkedBugId` are saved together in a transaction; existing links and recorded test results are preserved.
 
 ## Configure
 
@@ -47,6 +51,7 @@ Copy `.env.example` to `.env.local`:
 ```env
 MONGODB_URI=mongodb+srv://USERNAME:PASSWORD@cluster.mongodb.net/?retryWrites=true&w=majority
 MONGODB_DB=product_engineering
+MONGODB_SERVER_SELECTION_TIMEOUT_MS=30000
 GROQ_API_KEY=gsk_your_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 GROQ_ROUTER_MODEL=llama-3.1-8b-instant
@@ -103,6 +108,18 @@ npm run test:integration
 ```
 
 This uses `TEST_USER_ID` (default `u-pm-1`) and captures audit entries in memory; it does not seed or change records. See [the native MongoDB implementation report](docs/NATIVE_MONGODB_REFACTOR.md).
+
+To check database connectivity without model calls or record writes:
+
+```powershell
+npm run check:db
+```
+
+Connections are shared across requests and development reloads. The server
+selection timeout defaults to 30 seconds and can be configured from 1 to 60
+seconds with `MONGODB_SERVER_SELECTION_TIMEOUT_MS`. Failed connection and
+conversation-storage initialization attempts can recover on the next request.
+See [database timeout recovery](docs/DATABASE_CONNECTION_FIX.md).
 
 ## Seed data for acceptance testing
 

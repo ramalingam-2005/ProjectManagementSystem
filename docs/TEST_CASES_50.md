@@ -2,7 +2,7 @@
 
 Checked on 2026-10-01 with Node.js v22.15.0.
 
-**Result: all 50 new cases passed. The full suite, including subsequent chat regressions, passes all 130 tests with no failures, skips or cancellations.**
+**Result: all 50 new cases passed. The full suite, including subsequent chat regressions, passes all 145 tests with no failures, skips or cancellations.**
 
 TypeScript checking (`npm run typecheck`) also passed.
 

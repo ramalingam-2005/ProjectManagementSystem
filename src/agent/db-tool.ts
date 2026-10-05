@@ -4,6 +4,8 @@ import { getAllowedCollections } from "@/src/security/policy";
 import { executeDatabaseAction } from "@/src/services/database-action.service";
 import { auditDatabaseAction, redactDatabaseAction } from "@/src/services/database-audit.service";
 import { READ_OPERATIONS } from "@/src/security/mongo-policy";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
+import { INSERT_ONE_PAYLOAD_ERROR, INSERT_MANY_PAYLOAD_ERROR, SprintCreationError, BugWorkflowError } from "@/src/utils/business-action-errors";
 import type { MongoReadAction } from "@/src/db/mongo-action";
 import type { AgentName, AgentTrace, Caller, DatabaseAction } from "@/src/types";
 
@@ -38,8 +40,8 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
     reason: z.string().max(180).optional(),
     conditionsJson: z.string().optional().describe('Business actions only: JSON array of {field,operator,stringValue?|numberValue?|booleanValue?|valueList?}. operator is required: eq/ne/in/nin/contains/starts_with/gt/gte/lt/lte. Example: [{"field":"taskKey","operator":"eq","stringValue":"TASK-207"}].'),
     logic: z.enum(["AND", "OR"]).optional(),
-    fieldsJson: z.string().optional().describe('Mutations only: JSON array of {field,stringValue?|numberValue?|booleanValue?|stringListValue?}. Example: [{"field":"assignee","stringValue":"Rahul Kumar"}].'),
-    documentsJson: z.string().optional().describe("Business insert_many only: array of {fields:[...]} (max 5)."),
+    fieldsJson: z.string().optional().describe('Required for insert_one/update_one/update_many: JSON string encoding an array of FieldChange objects {field,stringValue?|numberValue?|booleanValue?|stringListValue?}. Example: [{"field":"sprintNumber","numberValue":15}]. Never use documentsJson for insert_one.'),
+    documentsJson: z.string().optional().describe("Required for insert_many only: JSON string encoding an array of {fields:[FieldChange,...]} (max 5). Never use for insert_one; do not combine with fieldsJson."),
     metric: z.enum(["developer_workload", "sprint_overload_summary", "release_readiness"]).optional().describe("Required when operation=calculate. Use conditionsJson to select the requested records; native filter/sort/projection/limit fields are not valid for calculations."),
   }).strict();
 
@@ -52,16 +54,20 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
       if (read || !["insert_one", "insert_many", "update_one", "update_many", "calculate"].includes(input.operation)) {
         action = Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as unknown as MongoReadAction;
       } else {
+        if (input.operation === "insert_one" && (input.fieldsJson === undefined || input.documentsJson !== undefined)) throw new Error(INSERT_ONE_PAYLOAD_ERROR);
+        if (input.operation === "insert_many" && (input.documentsJson === undefined || input.fieldsJson !== undefined)) throw new Error(INSERT_MANY_PAYLOAD_ERROR);
         if (["filter", "projection", "sort", "skip", "pipeline", "limit"].some((key) => input[key as keyof typeof input] !== undefined)) {
           throw new Error("NATIVE_MUTATIONS_NOT_ALLOWED:Business actions use conditionsJson for selection. Calculations require metric; mutations use fieldsJson/documentsJson. Do not send native filter/sort/projection/limit/skip/pipeline fields.");
         }
         const fields = json(input.fieldsJson, z.array(FieldSchema).max(15), "fieldsJson");
+        if (input.operation === "insert_one" && !fields?.length) throw new Error(INSERT_ONE_PAYLOAD_ERROR);
+        const documents = json(input.documentsJson, z.array(z.object({ fields: z.array(FieldSchema).min(1).max(15) }).strict()).min(1).max(5), "documentsJson");
         action = {
           collection: input.collection, operation: input.operation as DatabaseAction["operation"],
           conditions: json(input.conditionsJson, z.array(ConditionSchema).max(12), "conditionsJson"), logic: input.logic,
           fields: fields?.map((entry) => ({ ...entry, field: entry.field === "blocker.blocked" ? "blocked"
             : ["blocker.reason", "blocker.blockerReason"].includes(entry.field) ? "blockerReason" : entry.field })),
-          documents: json(input.documentsJson, z.array(z.object({ fields: z.array(FieldSchema).min(1).max(15) }).strict()).max(5), "documentsJson"),
+          documents,
           metric: input.metric, reason: input.reason ?? "",
         };
       }
@@ -70,7 +76,21 @@ export function makeDatabaseTool(agent: AgentName, caller: Caller, traces: Agent
       traces.push({ agent, generatedAction: redactDatabaseAction(action), guardrail: "ALLOWED", result });
       return JSON.stringify(result);
     } catch (error) {
-      const result = { ok: false, error: error instanceof Error ? String(redactDatabaseAction(error.message)) : "ACTION_REJECTED" };
+      const unavailable = databaseErrorResponse(error);
+      const message = unavailable?.message ?? (error instanceof Error ? String(redactDatabaseAction(error.message)) : "ACTION_REJECTED");
+      const invalidPayload = !dispatched && /^(INVALID_INSERT_PAYLOAD|INVALID_BUSINESS_ACTION_JSON):/.test(message);
+      const sprintError = error instanceof SprintCreationError ? error : undefined;
+      const bugError = error instanceof BugWorkflowError ? error : undefined;
+      const result = {
+        ok: false, ...(unavailable ? { code: unavailable.code } : {}), error: message,
+        ...(invalidPayload || sprintError || bugError ? {
+          code: message.split(":")[0], executionStatus: "NOT_EXECUTED",
+          retryable: invalidPayload || Boolean(sprintError?.correction),
+          userMessage: bugError?.userMessage ?? sprintError?.userMessage ?? (input.collection === "sprints" && input.operation === "insert_one"
+            ? "I couldn't create the sprint because the internal sprint-creation action failed validation."
+            : "I couldn't complete the request because the internal action failed validation."),
+        } : {}),
+      };
       traces.push({ agent, generatedAction: redactDatabaseAction(action ?? input), guardrail: "REJECTED", result });
       if (!dispatched) {
         try { await auditDatabaseAction(agent, caller, input, "REJECTED", "NOT_EXECUTED", result.error.split(":")[0]); } catch { /* Retain refusal. */ }

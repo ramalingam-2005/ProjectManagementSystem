@@ -5,6 +5,7 @@ import { authorizeMongoRead, MONGO_LIMITS, type MongoReadOperation } from "@/src
 import { buildScopeFilter } from "@/src/services/scope.service";
 import { auditDatabaseAction } from "@/src/services/database-audit.service";
 import type { AgentName, Caller } from "@/src/types";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
 
 async function scope(agent: AgentName, caller: Caller, collection: string, operation: MongoReadOperation) {
   return buildScopeFilter(collection, authorizeMongoRead(agent, caller, collection, operation).scope, caller);
@@ -76,9 +77,13 @@ export async function executeMongoRead(agent: AgentName, caller: Caller, input: 
   } catch (error) {
     const message = error instanceof Error ? error.message : "DATABASE_READ_FAILED";
     const code = message.split(":")[0];
-    try { await auditDatabaseAction(agent, caller, input, validated ? "ALLOWED" : "REJECTED", validated ? "FAILED" : "NOT_EXECUTED", code); }
-    catch { /* Preserve the original failure, never return an unaudited read result. */ }
-    if (validated && !/^RESULT_TOO_LARGE/.test(message)) throw new Error("DATABASE_READ_FAILED:Query execution or audit failed.");
+    // The audit uses the same unavailable database. Do not repeat connection
+    // waits for a failure that cannot be recorded until connectivity recovers.
+    if (!databaseErrorResponse(error)) {
+      try { await auditDatabaseAction(agent, caller, input, validated ? "ALLOWED" : "REJECTED", validated ? "FAILED" : "NOT_EXECUTED", code); }
+      catch { /* Preserve the original failure, never return an unaudited read result. */ }
+    }
+    if (validated && !/^RESULT_TOO_LARGE/.test(message)) throw new Error("DATABASE_READ_FAILED:Query execution or audit failed.", { cause: error });
     throw error;
   }
 }

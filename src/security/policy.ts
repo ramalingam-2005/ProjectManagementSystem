@@ -100,7 +100,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
       bugs: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ALL",
-        mutableFields: ["bugKey", "productId", "sourceTestCaseId", "assigneeId", "assignee", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "qaVerificationResult"],
+        mutableFields: ["productId", "sourceTestCaseId", "sourceTestCase", "testExecutionAttempt", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "qaVerificationResult"],
       },
       test_cases: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
@@ -113,7 +113,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
       bugs: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ASSIGNED",
-        mutableFields: ["bugKey", "productId", "sourceTestCaseId", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "fixSummary"],
+        mutableFields: ["productId", "sourceTestCaseId", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "fixSummary"],
       },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ASSIGNED" },
       tasks: { ops: ["find", "find_one", "count"], scope: "OWN" },
@@ -121,7 +121,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
     ENGINEERING_LEAD: {
       bugs: {
         ops: ["find", "find_one", "count", "update_one"],
-        scope: "TEAM",
+        scope: "ALL",
         mutableFields: ["assigneeId", "assignee", "severity", "status"],
       },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ALL" },
@@ -157,7 +157,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
         mutableFields: ["productId", "version", "status"],
       },
       tasks: { ops: ["find", "find_one", "count"], scope: "TEAM" },
-      bugs: { ops: ["find", "find_one", "count"], scope: "TEAM" },
+      bugs: { ops: ["find", "find_one", "count"], scope: "ALL" },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ALL" },
     },
     DEVELOPER: {

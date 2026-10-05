@@ -167,19 +167,62 @@ test("Every specialist recovers from oversized context through the shared eviden
 
 test("If both model steps fail after a write, the response retains its receipt and unfinished work", async (t) => {
   const { runSpecialistAgent } = graphFixture(t);
-  let calls = 0, writes = 0;
+  let calls = 0, writes = 0, finalCalls = 0;
   t.mock.method(actions, "executeDatabaseAction", async () => { writes++; return { ok: true, result: { insertedId: "bbbbbbbbbbbbbbbbbbbbbbbb" } }; });
   t.mock.method(models, "getModel", () => ({
     bindTools: () => ({ async invoke() {
       if (++calls === 1) return call("insert", "SPRINT_TASK", { collection: "tasks", operation: "insert_one", reason: "Create the requested task", fieldsJson: '[{"field":"title","stringValue":"Implement login"}]' });
       throw Object.assign(new Error("Request too large"), { status: 413 });
     } }),
-    async invoke() { throw Object.assign(new Error("Request too large"), { status: 413 }); },
+    async invoke() { finalCalls++; throw Object.assign(new Error("Request too large"), { status: 413 }); },
   }));
   const output = await runSpecialistAgent({ agent: "SPRINT_TASK", caller: lead, threadId: "receipt-fallback", message: "Create the first task, then prepare the other changes" });
   assert.match(output.response, /created bbbbbbbbbbbbbbbbbbbbbbbb/);
   assert.match(output.response, /remaining work is unfinished/);
   assert.doesNotMatch(output.response, /start a new chat|No actions/);
   assert.equal(writes, 1);
+  assert.equal(finalCalls, 1, "a final request that cannot shrink must not be repeated");
   assert.equal(output.trace.length, 1);
+});
+
+test("Textual tool calls trigger an evidence-only answer without executing the printed action", async (t) => {
+  const { runSpecialistAgent } = graphFixture(t);
+  let reads = 0, boundCalls = 0, finalCalls = 0;
+  const payload = { ok: true, result: { items: [{ taskKey: "TASK-14", status: "BLOCKED" }], hasMore: false } };
+  t.mock.method(actions, "executeDatabaseAction", async () => { reads++; return payload; });
+  t.mock.method(models, "getModel", () => ({
+    bindTools: () => ({ async invoke() {
+      if (++boundCalls === 1) return call("read", "SPRINT_TASK", { collection: "tasks", operation: "find", filter: { status: "BLOCKED" } });
+      return new AIMessage('<tool_call><function=sprint_task_database_action><parameter=operation>update_one</parameter></function></tool_call>');
+    } }),
+    async invoke(messages) {
+      finalCalls++;
+      assert.deepEqual(unpack(messages.findLast((message) => message.getType() === "tool")), payload);
+      assert.ok(messages.every((message) => !String(message.content).includes("<tool_call>")));
+      return new AIMessage("TASK-14 is blocked.");
+    },
+  }));
+  const result = await runSpecialistAgent({ agent: "SPRINT_TASK", caller: lead, threadId: "printed-tool-call", message: "Which tasks are blocked?" });
+  assert.equal(result.response, "TASK-14 is blocked.");
+  assert.equal(reads, 1);
+  assert.equal(finalCalls, 1);
+  assert.equal(result.trace.length, 1);
+});
+
+test("Repeated textual or malformed tool calls return an honest fallback without leaking markup", async (t) => {
+  const { runSpecialistAgent } = graphFixture(t);
+  let reads = 0;
+  t.mock.method(actions, "executeDatabaseAction", async () => { reads++; throw new Error("Printed calls must never execute"); });
+  for (const [index, malformed] of [
+    new AIMessage("<tool_call><function=sprint_task_database_action></function></tool_call>"),
+    new AIMessage(String.raw`\<tool\_call> \<function=sprint\_task\_database\_action> \</function> \</tool\_call>`),
+    new AIMessage({ content: "", invalid_tool_calls: [{ name: "sprint_task_database_action", args: "{", error: "Invalid JSON", type: "invalid_tool_call" }] }),
+  ].entries()) {
+    t.mock.method(models, "getModel", () => ({ bindTools: () => ({ async invoke() { return malformed; } }), async invoke() { return malformed; } }));
+    const result = await runSpecialistAgent({ agent: "SPRINT_TASK", caller: lead, threadId: `malformed-tool-${index}`, message: "Which tasks are blocked?" });
+    assert.match(result.response, /No database action was completed/);
+    assert.doesNotMatch(result.response, /tool.call|<function|No response generated/);
+    assert.equal(result.trace.length, 0);
+  }
+  assert.equal(reads, 0);
 });

@@ -3,6 +3,7 @@ import { runChat } from "@/src/agent/supervisor";
 import { resolveCaller } from "@/src/repositories/user.repository";
 import { RequirementsReviewSchema } from "@/src/requirements-review";
 import { modelErrorResponse } from "@/src/utils/model-errors";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
 
 export const runtime = "nodejs";
 
@@ -39,6 +40,8 @@ export async function POST(request: Request) {
       ...result,
     });
   } catch (error) {
+    const databaseError = databaseErrorResponse(error);
+    if (databaseError) return NextResponse.json({ ok: false, code: databaseError.code, error: databaseError.message }, { status: databaseError.status });
     const modelError = modelErrorResponse(error);
     if (modelError) return NextResponse.json({ ok: false, error: modelError.message }, { status: modelError.status });
     const message = error instanceof Error ? error.message : "Unknown error";

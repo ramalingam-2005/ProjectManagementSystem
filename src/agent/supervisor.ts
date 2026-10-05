@@ -6,6 +6,8 @@ import { getRequirementsReviewService } from "@/src/services/requirements-review
 import { chatThreadId, safeSessionId } from "@/src/utils/chat-session";
 import { recordListIntent } from "@/src/agent/record-list";
 
+export const WORKSPACE_SCOPE_RESPONSE = "That request is outside my product-engineering workspace scope. I can help with requirements, sprints and tasks, bugs and QA, releases, and internal documentation.";
+
 export async function runChat(input: {
   caller: Caller;
   sessionId: string;
@@ -17,9 +19,13 @@ export async function runChat(input: {
   if (!message) throw new Error("MESSAGE_REQUIRED");
   if (message.length > 4000) throw new Error("MESSAGE_TOO_LONG");
 
-  const agent = input.requirementsReview ? "REQUIREMENTS" : await routeAgent(input.caller, sessionId, message);
   const threadId = chatThreadId(input.caller, sessionId);
   if (input.requirementsReview && input.caller.role !== "PRODUCT_MANAGER") throw new Error("REVIEW_PM_ONLY");
+  const agent = await routeAgent(input.caller, sessionId, message, Boolean(input.requirementsReview));
+  if (agent === "OUT_OF_SCOPE") return {
+    agent, threadId, response: WORKSPACE_SCOPE_RESPONSE, trace: [],
+    requirementsReview: undefined, requirementsReviewUnchanged: Boolean(input.requirementsReview),
+  };
   const service = agent === "REQUIREMENTS" && input.caller.role === "PRODUCT_MANAGER"
     && (!recordListIntent(message) || input.requirementsReview)
     ? await getRequirementsReviewService() : undefined;

@@ -2,12 +2,16 @@ import { executeMongoRead } from "@/src/services/mongo-read.service";
 import { auditDatabaseAction, redactDatabaseAction } from "@/src/services/database-audit.service";
 import { READ_OPERATIONS } from "@/src/security/mongo-policy";
 import type { MongoReadAction } from "@/src/db/mongo-action";
-import { ObjectId, type Document, type Filter } from "mongodb";
+import { ObjectId, type ClientSession, type Document, type Filter } from "mongodb";
 import { getCollectionSchema } from "@/src/config/schema-registry";
-import { getDb } from "@/src/db/mongodb";
+import { getDb, getMongoClient } from "@/src/db/mongodb";
 import { resolveUserObjectId } from "@/src/repositories/user.repository";
 import { authorize } from "@/src/security/guardrails";
 import { buildScopeFilter } from "@/src/services/scope.service";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
+import { prepareSprintInsert } from "@/src/services/sprint-creation.service";
+import { prepareBugInsert, prepareBugUpdate } from "@/src/services/bug-workflow.service";
+import { BugWorkflowError } from "@/src/utils/business-action-errors";
 import type {
   AgentName,
   Caller,
@@ -317,14 +321,8 @@ function validateBusinessMutation(caller: Caller, action: DatabaseAction, set: R
     if (!allowed.has(String(set.status))) throw new Error(`INVALID_DEVELOPER_TASK_STATUS:${String(set.status)}`);
   }
 
-  if (caller.role === "DEVELOPER" && action.collection === "bugs" && "status" in set) {
-    if (String(set.status) !== "FIX_READY") throw new Error("DEVELOPER_CAN_ONLY_MARK_BUG_FIX_READY");
-  }
-
-  if (caller.role === "QA" && action.collection === "bugs" && "status" in set) {
-    const allowed = new Set(["NEW", "ASSIGNED", "VERIFIED_CLOSED", "REOPENED"]);
-    if (!allowed.has(String(set.status))) throw new Error(`INVALID_QA_BUG_STATUS:${String(set.status)}`);
-  }
+  // Bug creation, assignment and lifecycle transitions are validated by the
+  // dedicated bug workflow service, including the current record state.
 
   if (caller.role === "PRODUCT_MANAGER" && action.collection === "user_stories" && "status" in set) {
     const allowed = new Set(["DRAFT", "APPROVED"]);
@@ -340,6 +338,7 @@ function insertSystemFields(collection: string, caller: Caller): Record<string, 
   if (collection === "feature_requests") return { ...common, requestedBy: callerId, submittedAt: now };
   if (collection === "epics") return { ...common, generatedByAI: true, createdBy: callerId };
   if (collection === "tasks") return { ...common, createdBy: callerId };
+  if (collection === "sprints") return { ...common, createdBy: callerId };
   if (collection === "bugs") return { ...common, reportedBy: callerId };
   if (collection === "user_stories") return { ...common, status: "DRAFT", generatedByAI: true, createdBy: callerId };
   return common;
@@ -384,7 +383,7 @@ async function nextPublicKeys(collection: string, field: string, prefix: string,
   return Array.from({ length: count }, (_, index) => `${prefix}-${firstNumber + index}`);
 }
 
-async function audit(caller: Caller, agent: AgentName, action: DatabaseAction, result: unknown) {
+async function audit(caller: Caller, agent: AgentName, action: DatabaseAction, result: unknown, session?: ClientSession) {
   const db = await getDb();
   await db.collection("audit_logs").insertOne({
     userId: new ObjectId(caller.mongoUserId),
@@ -398,7 +397,7 @@ async function audit(caller: Caller, agent: AgentName, action: DatabaseAction, r
     generatedAction: redactDatabaseAction(action),
     resultSummary: redactDatabaseAction(result),
     timestamp: new Date(),
-  });
+  }, { session });
 }
 
 async function validateTaskInsert(action: DatabaseAction) {
@@ -672,9 +671,11 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, in
     allowed = true;
     return await executeBusinessAction(agent, caller, action);
   } catch (error) {
-    try { await auditDatabaseAction(agent, caller, action, allowed ? "ALLOWED" : "REJECTED",
-      allowed ? "FAILED" : "NOT_EXECUTED", error instanceof Error ? error.message.split(":")[0] : "BUSINESS_ACTION_FAILED"); }
-    catch { /* Preserve the business failure and do not replay a mutation. */ }
+    if (!databaseErrorResponse(error)) {
+      try { await auditDatabaseAction(agent, caller, action, allowed ? "ALLOWED" : "REJECTED",
+        allowed ? "FAILED" : "NOT_EXECUTED", error instanceof Error ? error.message.split(":")[0] : "BUSINESS_ACTION_FAILED"); }
+      catch { /* Preserve the business failure and do not replay a mutation. */ }
+    }
     throw error;
   }
 }
@@ -694,18 +695,44 @@ async function executeBusinessAction(agent: AgentName, caller: Caller, action: D
   }
 
   const collection = db.collection(action.collection);
-  const filter = await buildFilter(action, caller, rule.scope);
+  const filter = ["insert_one", "insert_many"].includes(action.operation)
+    ? await buildScopeFilter(action.collection, rule.scope, caller)
+    : await buildFilter(action, caller, rule.scope);
   let result: unknown;
 
   if (action.operation === "insert_one") {
     await validateTaskInsert(action);
-    const userFields = await buildSetDocument(action, caller);
+    const preparedBug = action.collection === "bugs" ? await prepareBugInsert(action.fields, caller) : undefined;
+    const userFields = action.collection === "sprints"
+      ? await prepareSprintInsert(Object.fromEntries((action.fields ?? []).map((field) => [field.field, rawFieldValue(field)])), filter)
+      : preparedBug ? preparedBug.document
+      : await buildSetDocument(action, caller);
     validateBusinessMutation(caller, action, userFields);
     let document = { ...insertSystemFields(action.collection, caller), ...userFields };
     document = await addGeneratedKey(action.collection, document);
-    const insertResult = await collection.insertOne(document);
-    result = { insertedId: insertResult.insertedId, document: { _id: insertResult.insertedId, ...document } };
-    await audit(caller, agent, action, { insertedId: insertResult.insertedId });
+    const link = preparedBug?.testLink;
+    if (link) {
+      // The ID is stable across the driver's transaction callback retries.
+      // No success receipt is returned until the bug, execution link and audit
+      // commit together. Unknown commit outcomes must not be replayed by the LLM.
+      const bugId = new ObjectId();
+      const stored = { ...document, _id: bugId };
+      const linkedTestExecution = { testCaseKey: link.testCaseKey, releaseVersion: link.releaseVersion, attempt: link.attempt };
+      const client = await getMongoClient();
+      result = await client.withSession((session) => session.withTransaction(async () => {
+        await collection.insertOne(stored, { session });
+        const linked = await db.collection("test_cases").updateOne({
+          _id: link.testCaseId, productId: link.productId, active: { $ne: false }, executions: link.executions,
+        }, { $set: { [`executions.${link.executionIndex}.linkedBugId`]: bugId, updatedAt: new Date() } }, { session });
+        if (linked.matchedCount !== 1) throw new BugWorkflowError("BUG_TEST_EXECUTION_CHANGED", "The selected test execution changed or was linked to another bug. No new bug was saved. Refresh the test case before trying again.");
+        await audit(caller, agent, action, { insertedId: bugId, linkedTestExecution, sourceTestCaseId: link.testCaseId }, session);
+        return { insertedId: bugId, document: stored, linkedTestExecution };
+      }));
+    } else {
+      const insertResult = await collection.insertOne(document);
+      result = { insertedId: insertResult.insertedId, document: { _id: insertResult.insertedId, ...document } };
+      await audit(caller, agent, action, { insertedId: insertResult.insertedId });
+    }
   } else if (action.operation === "insert_many") {
     const entries = action.documents ?? [];
     const generatedKeys = action.collection === "user_stories"
@@ -738,11 +765,14 @@ async function executeBusinessAction(agent: AgentName, caller: Caller, action: D
     };
     await audit(caller, agent, action, { insertedCount: inserted.insertedCount, insertedIds: inserted.insertedIds });
   } else if (action.operation === "update_one") {
-    const set = { ...(await buildSetDocument(action, caller)), updatedAt: new Date() };
+    const bugUpdate = action.collection === "bugs" ? await prepareBugUpdate(action.fields, caller, filter) : undefined;
+    const set = { ...(bugUpdate?.set ?? await buildSetDocument(action, caller)), updatedAt: new Date() };
     validateBusinessMutation(caller, action, set);
     if (action.collection === "releases") await enforceReleaseMutationPreconditions(caller, filter, set);
-    const updateResult = await collection.updateOne(filter, { $set: set });
-    result = { matchedCount: updateResult.matchedCount, modifiedCount: updateResult.modifiedCount };
+    const updateResult = await collection.updateOne(bugUpdate?.filter ?? filter, { $set: set });
+    if (bugUpdate && updateResult.matchedCount !== 1) throw new BugWorkflowError("BUG_CHANGED", "The bug changed while this action was being prepared. Refresh it before trying again; this action did not change the bug.");
+    result = { matchedCount: updateResult.matchedCount, modifiedCount: updateResult.modifiedCount,
+      ...(bugUpdate ? { bugKey: bugUpdate.bugKey, status: bugUpdate.status } : {}) };
     await audit(caller, agent, action, result);
   } else if (action.operation === "update_many") {
     const ids = await collection.find(filter, { projection: { _id: 1 } }).limit(maxBulkUpdate + 1).toArray();

@@ -73,6 +73,7 @@ export const COLLECTION_SCHEMAS = {
     description: "Sprint planning, dates and developer capacities.",
     fields: {
       _id: { type: "ObjectId", queryable: true, selectable: true },
+      createdBy: { type: "ObjectId", queryable: true, selectable: true },
       sprintNumber: { type: "number", queryable: true, selectable: true },
       name: { type: "string", queryable: true, selectable: true },
       status: { type: "string", queryable: true, selectable: true },
@@ -122,12 +123,13 @@ export const COLLECTION_SCHEMAS = {
   },
 
   bugs: {
-    description: "Software defects reported from QA or engineering.",
+    description: "Shared bug backlog visible to every Engineering Lead. New reports are NEW and unassigned; leads assign active developers.",
     fields: {
       _id: { type: "ObjectId", queryable: true, selectable: true },
       bugKey: { type: "string", queryable: true, selectable: true },
       productId: { type: "ObjectId", queryable: true, selectable: true },
       sourceTestCaseId: { type: "ObjectId", queryable: true, selectable: true },
+      sourceTestExecutionAttempt: { type: "number", queryable: true, selectable: true },
       reportedBy: { type: "ObjectId", queryable: true, selectable: true },
       assigneeId: { type: "ObjectId", queryable: true, selectable: true },
       affectedReleaseVersion: { type: "string", queryable: true, selectable: true },
@@ -138,6 +140,7 @@ export const COLLECTION_SCHEMAS = {
       logs: { type: "string", queryable: true, selectable: true },
       severity: { type: "string", queryable: true, selectable: true },
       status: { type: "string", queryable: true, selectable: true },
+      duplicateOfBugId: { type: "ObjectId", queryable: true, selectable: true },
       "fixDetails.fixSummary": { type: "string", queryable: true, selectable: false },
       "qaVerification.result": { type: "string", queryable: true, selectable: false },
       fixDetails: { type: "object", queryable: false, selectable: true },
@@ -148,6 +151,8 @@ export const COLLECTION_SCHEMAS = {
     virtualFields: {
       key: { type: "string", queryable: true, description: "Alias for bugKey or Mongo _id." },
       assignee: { type: "string", queryable: true, description: "Developer email, userKey, name or Mongo _id." },
+      sourceTestCase: { type: "string", queryable: false, description: "QA creation only: source test-case key (e.g. TC-106) or ID; backend links the selected execution." },
+      testExecutionAttempt: { type: "number", queryable: false, description: "QA creation only: recorded attempt number, paired with affectedReleaseVersion to select the exact execution." },
     },
     relationships: { sourceTestCaseId: "test_cases._id", assigneeId: "users._id" },
     defaultProjection: ["bugKey", "title", "component", "severity", "status", "assigneeId", "affectedReleaseVersion", "stepsToReproduce", "fixDetails", "qaVerification"],
@@ -165,6 +170,8 @@ export const COLLECTION_SCHEMAS = {
       targetVersions: { type: "string[]", queryable: true, selectable: true },
       "executions.releaseVersion": { type: "string", queryable: true, selectable: false },
       "executions.result": { type: "string", queryable: true, selectable: false },
+      "executions.attempt": { type: "number", queryable: true, selectable: false },
+      "executions.linkedBugId": { type: "ObjectId", queryable: true, selectable: false },
       executions: { type: "array", queryable: false, selectable: true },
       createdAt: { type: "date", queryable: true, selectable: true },
       updatedAt: { type: "date", queryable: true, selectable: true },

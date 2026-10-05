@@ -1,9 +1,17 @@
-import { ObjectId, type Document, type Filter } from "mongodb";
+import { executeMongoRead } from "@/src/services/mongo-read.service";
+import { auditDatabaseAction, redactDatabaseAction } from "@/src/services/database-audit.service";
+import { READ_OPERATIONS } from "@/src/security/mongo-policy";
+import type { MongoReadAction } from "@/src/db/mongo-action";
+import { ObjectId, type ClientSession, type Document, type Filter } from "mongodb";
 import { getCollectionSchema } from "@/src/config/schema-registry";
-import { getDb } from "@/src/db/mongodb";
+import { getDb, getMongoClient } from "@/src/db/mongodb";
 import { resolveUserObjectId } from "@/src/repositories/user.repository";
-import { authorize, MAX_READ_LIMIT } from "@/src/security/guardrails";
+import { authorize } from "@/src/security/guardrails";
 import { buildScopeFilter } from "@/src/services/scope.service";
+import { databaseErrorResponse } from "@/src/utils/database-errors";
+import { prepareSprintInsert } from "@/src/services/sprint-creation.service";
+import { prepareBugInsert, prepareBugUpdate } from "@/src/services/bug-workflow.service";
+import { BugWorkflowError } from "@/src/utils/business-action-errors";
 import type {
   AgentName,
   Caller,
@@ -250,50 +258,6 @@ async function buildFilter(action: DatabaseAction, caller: Caller, scope: string
   return combineFilters([requested, enforced], "AND");
 }
 
-// Suggestions are read-only evidence, never a replacement mutation filter.
-async function featureTitleSuggestions(action: DatabaseAction, caller: Caller, scope: string) {
-  if (action.collection !== "feature_requests" || action.conditions?.length !== 1) return null;
-  const condition = action.conditions[0];
-  if (!["title", "key", "featureRequestKey"].includes(condition.field)
-    || !["eq", "contains"].includes(condition.operator)) return null;
-  const text = condition.stringValue?.trim();
-  if (!text || text.length > 240 || ObjectId.isValid(text)
-    || /^(?:FR|feature(?:\s+request)?)\s*[-#]?\s*\d+$/i.test(text)) return null;
-  const db = await getDb();
-  const enforced = await buildScopeFilter("feature_requests", scope as "OWN" | "TEAM" | "ALL" | "ASSIGNED", caller);
-  const projection = { ...projectionFor(action), _id: 1, featureRequestKey: 1, title: 1 };
-  const tokens = [...new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
-    .filter((word) => !["the", "a", "an", "of", "for", "and"].includes(word));
-  const searches: Array<{ matchType: string; filter: Filter<Document> }> = [
-    { matchType: "exact_title", filter: { title: { $regex: `^${escapeRegex(text)}$`, $options: "i" } } },
-    { matchType: "partial_title", filter: { title: { $regex: escapeRegex(text), $options: "i" } } },
-  ];
-  if (tokens.length >= 2 && tokens.length <= 12) searches.push({
-    matchType: "title_keywords",
-    filter: { $and: tokens.map((word) => ({ title: { $regex: `\\b${escapeRegex(word)}\\b`, $options: "i" } })) },
-  });
-  // If all keywords fail, allow one differing word without any synonym or
-  // feature-specific mappings. Keep at least two words and every numeric token.
-  if (tokens.length >= 3 && tokens.length <= 12 && tokens.some((word) => !/\d/.test(word))) searches.push({
-    matchType: "partial_keywords",
-    filter: { $or: tokens.flatMap((word, omitted) => /\d/.test(word) ? [] : [{
-      $and: tokens.filter((_, index) => index !== omitted)
-        .map((token) => ({ title: { $regex: `\\b${escapeRegex(token)}\\b`, $options: "i" } })),
-    }]) },
-  });
-  for (const search of searches) {
-    const rows = await db.collection("feature_requests")
-      .find(combineFilters([search.filter, enforced]), { projection }).sort({ _id: 1 }).limit(6).toArray();
-    if (rows.length) return {
-      matches: rows.slice(0, 5), matchType: search.matchType,
-      requiresClarification: rows.length > 1 || search.matchType !== "exact_title",
-      hasMore: rows.length > 5,
-      note: "Show the stored title, featureRequestKey and _id. For partial matches, describe them as possible matches. Ask the user to choose when ambiguous; use the confirmed ID for any later action.",
-    };
-  }
-  return null;
-}
-
 async function fieldToSet(collection: string, field: FieldChange, caller: Caller): Promise<Record<string, unknown>> {
   const raw = rawFieldValue(field);
 
@@ -351,26 +315,14 @@ async function buildSetDocument(action: DatabaseAction, caller: Caller): Promise
   return set;
 }
 
-function projectionFor(action: DatabaseAction): Record<string, 1> {
-  const schema = getCollectionSchema(action.collection);
-  const fields = action.selectFields?.length ? action.selectFields : schema?.defaultProjection ?? [];
-  return Object.fromEntries(["_id", ...fields].map((field) => [field, 1])) as Record<string, 1>;
-}
-
 function validateBusinessMutation(caller: Caller, action: DatabaseAction, set: Record<string, unknown>) {
   if (caller.role === "DEVELOPER" && action.collection === "tasks" && "status" in set) {
     const allowed = new Set(["TODO", "IN_PROGRESS", "BLOCKED", "DONE"]);
     if (!allowed.has(String(set.status))) throw new Error(`INVALID_DEVELOPER_TASK_STATUS:${String(set.status)}`);
   }
 
-  if (caller.role === "DEVELOPER" && action.collection === "bugs" && "status" in set) {
-    if (String(set.status) !== "FIX_READY") throw new Error("DEVELOPER_CAN_ONLY_MARK_BUG_FIX_READY");
-  }
-
-  if (caller.role === "QA" && action.collection === "bugs" && "status" in set) {
-    const allowed = new Set(["NEW", "ASSIGNED", "VERIFIED_CLOSED", "REOPENED"]);
-    if (!allowed.has(String(set.status))) throw new Error(`INVALID_QA_BUG_STATUS:${String(set.status)}`);
-  }
+  // Bug creation, assignment and lifecycle transitions are validated by the
+  // dedicated bug workflow service, including the current record state.
 
   if (caller.role === "PRODUCT_MANAGER" && action.collection === "user_stories" && "status" in set) {
     const allowed = new Set(["DRAFT", "APPROVED"]);
@@ -386,6 +338,7 @@ function insertSystemFields(collection: string, caller: Caller): Record<string, 
   if (collection === "feature_requests") return { ...common, requestedBy: callerId, submittedAt: now };
   if (collection === "epics") return { ...common, generatedByAI: true, createdBy: callerId };
   if (collection === "tasks") return { ...common, createdBy: callerId };
+  if (collection === "sprints") return { ...common, createdBy: callerId };
   if (collection === "bugs") return { ...common, reportedBy: callerId };
   if (collection === "user_stories") return { ...common, status: "DRAFT", generatedByAI: true, createdBy: callerId };
   return common;
@@ -430,19 +383,21 @@ async function nextPublicKeys(collection: string, field: string, prefix: string,
   return Array.from({ length: count }, (_, index) => `${prefix}-${firstNumber + index}`);
 }
 
-async function audit(caller: Caller, agent: AgentName, action: DatabaseAction, result: unknown) {
+async function audit(caller: Caller, agent: AgentName, action: DatabaseAction, result: unknown, session?: ClientSession) {
   const db = await getDb();
   await db.collection("audit_logs").insertOne({
     userId: new ObjectId(caller.mongoUserId),
     role: caller.role,
+    agent, collection: action.collection, operation: action.operation,
+    validationResult: "ALLOWED", executionStatus: "SUCCEEDED",
     action: `${agent}_${action.operation}`,
     entityType: action.collection.toUpperCase(),
     channel: "CHAT",
-    reason: action.reason,
-    generatedAction: action,
-    resultSummary: result,
+    reason: redactDatabaseAction(action.reason),
+    generatedAction: redactDatabaseAction(action),
+    resultSummary: redactDatabaseAction(result),
     timestamp: new Date(),
-  });
+  }, { session });
 }
 
 async function validateTaskInsert(action: DatabaseAction) {
@@ -702,13 +657,31 @@ async function enforceReleaseMutationPreconditions(
   if (caller.role === "QA" && wantsPmSignoff) throw new Error("QA_CANNOT_GRANT_PM_SIGNOFF");
 }
 
-export async function executeDatabaseAction(agent: AgentName, caller: Caller, action: DatabaseAction) {
-  // A requested read size is a planning hint. Clamp it before authorization,
-  // while invalid numbers and all write limits still go through the guard.
-  if (action.operation === "find" && Number.isSafeInteger(action.limit) && action.limit! > MAX_READ_LIMIT) {
-    action = { ...action, limit: MAX_READ_LIMIT };
+export async function executeDatabaseAction(agent: AgentName, caller: Caller, input: DatabaseAction | MongoReadAction) {
+  if (READ_OPERATIONS.includes(input.operation as MongoReadAction["operation"])) return executeMongoRead(agent, caller, input);
+  if (!["insert_one", "insert_many", "update_one", "update_many", "calculate"].includes(input.operation)) {
+    return executeMongoRead(agent, caller, input); // Shared schema/permission rejection and audit.
   }
-  const { rule, maxLimit, maxOffset, maxBulkUpdate } = authorize(agent, caller, action);
+  const action = input as DatabaseAction;
+  let allowed = false;
+  try {
+    const businessKeys = new Set(["collection", "operation", "conditions", "logic", "fields", "documents", "metric", "reason", "limit"]);
+    if (Object.keys(action).some((key) => !businessKeys.has(key))) throw new Error("NATIVE_MUTATIONS_NOT_ALLOWED");
+    authorize(agent, caller, action);
+    allowed = true;
+    return await executeBusinessAction(agent, caller, action);
+  } catch (error) {
+    if (!databaseErrorResponse(error)) {
+      try { await auditDatabaseAction(agent, caller, action, allowed ? "ALLOWED" : "REJECTED",
+        allowed ? "FAILED" : "NOT_EXECUTED", error instanceof Error ? error.message.split(":")[0] : "BUSINESS_ACTION_FAILED"); }
+      catch { /* Preserve the business failure and do not replay a mutation. */ }
+    }
+    throw error;
+  }
+}
+
+async function executeBusinessAction(agent: AgentName, caller: Caller, action: DatabaseAction) {
+  const { rule, maxBulkUpdate } = authorize(agent, caller, action);
   const db = await getDb();
 
   if (action.operation === "calculate") {
@@ -717,42 +690,49 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, ac
     else if (action.metric === "sprint_overload_summary") result = await calculateSprintOverloadSummary(caller, action);
     else if (action.metric === "release_readiness") result = await calculateReleaseReadiness(action);
     else throw new Error(`UNSUPPORTED_METRIC:${String(action.metric)}`);
+    await audit(caller, agent, action, result);
     return { ok: true, agent, operation: "calculate", result };
   }
 
   const collection = db.collection(action.collection);
-  const filter = await buildFilter(action, caller, rule.scope);
-  const limit = Math.min(action.limit ?? 10, maxLimit);
+  const filter = ["insert_one", "insert_many"].includes(action.operation)
+    ? await buildScopeFilter(action.collection, rule.scope, caller)
+    : await buildFilter(action, caller, rule.scope);
   let result: unknown;
 
-  if (action.operation === "find") {
-    const offset = action.offset ?? 0;
-    const cursor = collection.find(filter, { projection: projectionFor(action) });
-    const sort: Record<string, 1 | -1> = action.sortField
-      ? { [action.sortField]: action.sortDirection === "asc" ? 1 : -1 } : { _id: 1 };
-    // A unique tie-breaker prevents equal sort values from shuffling between pages.
-    if (!("_id" in sort)) sort._id = 1;
-    const rows = await cursor.sort(sort).skip(offset).limit(limit + 1).toArray();
-    const hasMore = rows.length > limit;
-    const items = hasMore ? rows.slice(0, limit) : rows;
-    const nextOffset = hasMore && offset + items.length <= maxOffset ? offset + items.length : null;
-    result = {
-      items, returned: items.length, limit, offset, hasMore, nextOffset,
-      ...(hasMore && nextOffset === null ? { paginationNote: "Narrow the filters to retrieve additional records beyond the pagination limit." } : {}),
-    };
-  } else if (action.operation === "find_one") {
-    result = await collection.findOne(filter, { projection: projectionFor(action) });
-  } else if (action.operation === "count") {
-    result = { count: await collection.countDocuments(filter) };
-  } else if (action.operation === "insert_one") {
+  if (action.operation === "insert_one") {
     await validateTaskInsert(action);
-    const userFields = await buildSetDocument(action, caller);
+    const preparedBug = action.collection === "bugs" ? await prepareBugInsert(action.fields, caller) : undefined;
+    const userFields = action.collection === "sprints"
+      ? await prepareSprintInsert(Object.fromEntries((action.fields ?? []).map((field) => [field.field, rawFieldValue(field)])), filter)
+      : preparedBug ? preparedBug.document
+      : await buildSetDocument(action, caller);
     validateBusinessMutation(caller, action, userFields);
     let document = { ...insertSystemFields(action.collection, caller), ...userFields };
     document = await addGeneratedKey(action.collection, document);
-    const insertResult = await collection.insertOne(document);
-    result = { insertedId: insertResult.insertedId, document: { _id: insertResult.insertedId, ...document } };
-    await audit(caller, agent, action, { insertedId: insertResult.insertedId });
+    const link = preparedBug?.testLink;
+    if (link) {
+      // The ID is stable across the driver's transaction callback retries.
+      // No success receipt is returned until the bug, execution link and audit
+      // commit together. Unknown commit outcomes must not be replayed by the LLM.
+      const bugId = new ObjectId();
+      const stored = { ...document, _id: bugId };
+      const linkedTestExecution = { testCaseKey: link.testCaseKey, releaseVersion: link.releaseVersion, attempt: link.attempt };
+      const client = await getMongoClient();
+      result = await client.withSession((session) => session.withTransaction(async () => {
+        await collection.insertOne(stored, { session });
+        const linked = await db.collection("test_cases").updateOne({
+          _id: link.testCaseId, productId: link.productId, active: { $ne: false }, executions: link.executions,
+        }, { $set: { [`executions.${link.executionIndex}.linkedBugId`]: bugId, updatedAt: new Date() } }, { session });
+        if (linked.matchedCount !== 1) throw new BugWorkflowError("BUG_TEST_EXECUTION_CHANGED", "The selected test execution changed or was linked to another bug. No new bug was saved. Refresh the test case before trying again.");
+        await audit(caller, agent, action, { insertedId: bugId, linkedTestExecution, sourceTestCaseId: link.testCaseId }, session);
+        return { insertedId: bugId, document: stored, linkedTestExecution };
+      }));
+    } else {
+      const insertResult = await collection.insertOne(document);
+      result = { insertedId: insertResult.insertedId, document: { _id: insertResult.insertedId, ...document } };
+      await audit(caller, agent, action, { insertedId: insertResult.insertedId });
+    }
   } else if (action.operation === "insert_many") {
     const entries = action.documents ?? [];
     const generatedKeys = action.collection === "user_stories"
@@ -785,11 +765,14 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, ac
     };
     await audit(caller, agent, action, { insertedCount: inserted.insertedCount, insertedIds: inserted.insertedIds });
   } else if (action.operation === "update_one") {
-    const set = { ...(await buildSetDocument(action, caller)), updatedAt: new Date() };
+    const bugUpdate = action.collection === "bugs" ? await prepareBugUpdate(action.fields, caller, filter) : undefined;
+    const set = { ...(bugUpdate?.set ?? await buildSetDocument(action, caller)), updatedAt: new Date() };
     validateBusinessMutation(caller, action, set);
     if (action.collection === "releases") await enforceReleaseMutationPreconditions(caller, filter, set);
-    const updateResult = await collection.updateOne(filter, { $set: set });
-    result = { matchedCount: updateResult.matchedCount, modifiedCount: updateResult.modifiedCount };
+    const updateResult = await collection.updateOne(bugUpdate?.filter ?? filter, { $set: set });
+    if (bugUpdate && updateResult.matchedCount !== 1) throw new BugWorkflowError("BUG_CHANGED", "The bug changed while this action was being prepared. Refresh it before trying again; this action did not change the bug.");
+    result = { matchedCount: updateResult.matchedCount, modifiedCount: updateResult.modifiedCount,
+      ...(bugUpdate ? { bugKey: bugUpdate.bugKey, status: bugUpdate.status } : {}) };
     await audit(caller, agent, action, result);
   } else if (action.operation === "update_many") {
     const ids = await collection.find(filter, { projection: { _id: 1 } }).limit(maxBulkUpdate + 1).toArray();
@@ -803,8 +786,5 @@ export async function executeDatabaseAction(agent: AgentName, caller: Caller, ac
     throw new Error(`UNSUPPORTED_OPERATION:${action.operation}`);
   }
 
-  const emptyRead = action.operation === "find_one" ? result === null
-    : action.operation === "find" && !(action.offset ?? 0) && (result as { returned: number }).returned === 0;
-  if (emptyRead) result = await featureTitleSuggestions(action, caller, rule.scope) ?? result;
   return { ok: true, agent, collection: action.collection, operation: action.operation, result };
 }

@@ -4,6 +4,7 @@ export interface Rule {
   ops: DbOperation[];
   scope: Scope;
   mutableFields?: string[];
+  creationReview?: boolean;
 }
 
 type RoleRules = Partial<Record<string, Rule>>;
@@ -16,14 +17,15 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
         scope: "ALL",
         mutableFields: ["featureRequestKey", "productId", "title", "description", "source", "sourceDetail", "priority", "status"],
       },
-      // The AI may persist a DRAFT epic as part of requirement drafting. Engineering execution still
-      // starts only after PM approval; task creation remains an EL responsibility.
+      // Creation must pass through the PM review service.
       epics: {
+        creationReview: true,
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ALL",
         mutableFields: ["epicKey", "featureRequestId", "title", "description", "status"],
       },
       user_stories: {
+        creationReview: true,
         ops: ["find", "find_one", "count", "insert_one", "insert_many", "update_one", "update_many"],
         scope: "ALL",
         mutableFields: ["storyKey", "epicId", "title", "userStory", "acceptanceCriteria", "storyPoints", "priority", "status"],
@@ -98,7 +100,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
       bugs: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ALL",
-        mutableFields: ["bugKey", "productId", "sourceTestCaseId", "assigneeId", "assignee", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "qaVerificationResult"],
+        mutableFields: ["productId", "sourceTestCaseId", "sourceTestCase", "testExecutionAttempt", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "qaVerificationResult"],
       },
       test_cases: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
@@ -111,7 +113,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
       bugs: {
         ops: ["find", "find_one", "count", "insert_one", "update_one"],
         scope: "ASSIGNED",
-        mutableFields: ["bugKey", "productId", "sourceTestCaseId", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "fixSummary"],
+        mutableFields: ["productId", "sourceTestCaseId", "affectedReleaseVersion", "title", "description", "component", "stepsToReproduce", "logs", "severity", "status", "fixSummary"],
       },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ASSIGNED" },
       tasks: { ops: ["find", "find_one", "count"], scope: "OWN" },
@@ -119,7 +121,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
     ENGINEERING_LEAD: {
       bugs: {
         ops: ["find", "find_one", "count", "update_one"],
-        scope: "TEAM",
+        scope: "ALL",
         mutableFields: ["assigneeId", "assignee", "severity", "status"],
       },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ALL" },
@@ -155,7 +157,7 @@ export const POLICY: Record<AgentName, Partial<Record<Role, RoleRules>>> = {
         mutableFields: ["productId", "version", "status"],
       },
       tasks: { ops: ["find", "find_one", "count"], scope: "TEAM" },
-      bugs: { ops: ["find", "find_one", "count"], scope: "TEAM" },
+      bugs: { ops: ["find", "find_one", "count"], scope: "ALL" },
       test_cases: { ops: ["find", "find_one", "count"], scope: "ALL" },
     },
     DEVELOPER: {
@@ -181,7 +183,6 @@ export const NEVER_ALLOWED = new Set([
   "dropDatabase",
   "replace_one",
   "renameCollection",
-  "aggregate",
   "bulkWrite",
   "$where",
   "$function",

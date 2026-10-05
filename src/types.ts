@@ -7,6 +7,9 @@ export type AgentName =
   | "RELEASE"
   | "DOCUMENTATION";
 
+// A routing outcome, not an additional specialist or database permission.
+export type ChatRoute = AgentName | "OUT_OF_SCOPE";
+
 export type DbOperation =
   | "find"
   | "find_one"

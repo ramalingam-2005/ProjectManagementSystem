@@ -3,7 +3,7 @@ import type { AgentName, Role } from "@/src/types";
 export const AGENT_INFO: Record<AgentName, { label: string; purpose: string }> = {
   REQUIREMENTS: {
     label: "Requirements Agent",
-    purpose: "Feature requests, requirement drafting, draft epics and user stories, approval context.",
+    purpose: "Read and list stored feature requests, epics and user stories of any status; draft requirements and handle approval context.",
   },
   SPRINT_TASK: {
     label: "Sprint / Task Agent",
@@ -19,7 +19,7 @@ export const AGENT_INFO: Record<AgentName, { label: string; purpose: string }> =
   },
   DOCUMENTATION: {
     label: "Documentation Agent",
-    purpose: "Grounded search over internal documents with honest not-documented fallback.",
+    purpose: "Search stored internal documents for guides, policies and process explanations.",
   },
 };
 
